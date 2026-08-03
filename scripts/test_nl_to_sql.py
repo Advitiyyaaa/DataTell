@@ -26,7 +26,7 @@ from datetime import datetime
 sys.path.insert(0, str(Path(__file__).parent))
 
 from schema_utils import get_schema
-from nl_to_sql import nl_to_sql
+from nl_to_sql import nl_to_sql, validate_select_only, execute_sql
 
 # ---------------------------------------------------------------------------
 # 20 Test questions — Easy / Medium / Hard
@@ -62,7 +62,7 @@ TEST_QUESTIONS = [
         "id": 5,
         "tier": "easy",
         "question": "What is the distribution of payment types (count and total value per type)?",
-        "expected_rows": None,  # don't check exact row count
+        "expected_rows": 5,
     },
 
     # ---- Medium (10) — multi-table joins, group-by, having ----
@@ -83,6 +83,7 @@ TEST_QUESTIONS = [
         "tier": "medium",
         "question": "Which Brazilian state has the highest number of orders?",
         "expected_rows": 1,
+        "required_sql_terms": ["customer_state", "count"],
     },
     {
         "id": 9,
@@ -94,7 +95,8 @@ TEST_QUESTIONS = [
         "id": 10,
         "tier": "medium",
         "question": "How many orders were placed each month in 2018? Show month and count, ordered chronologically.",
-        "expected_rows": None,
+        "expected_rows": 10,
+        "required_sql_terms": ["strftime", "count"],
     },
     {
         "id": 11,
@@ -107,6 +109,7 @@ TEST_QUESTIONS = [
         "tier": "medium",
         "question": "Which 5 sellers have the highest average review score among sellers with at least 10 reviews?",
         "expected_rows": 5,
+        "required_sql_terms": ["seller_id", "seller_city", "having"],
     },
     {
         "id": 13,
@@ -150,7 +153,8 @@ TEST_QUESTIONS = [
         "id": 19,
         "tier": "hard",
         "question": "Show the monthly order count and cumulative order count for 2018, ordered by month.",
-        "expected_rows": None,
+        "expected_rows": 10,
+        "required_sql_terms": ["strftime", "over"],
     },
     {
         "id": 20,
@@ -164,6 +168,31 @@ TEST_QUESTIONS = [
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
+
+def evaluate_result(question: dict, result: dict) -> tuple[bool, list[str]]:
+    """Check execution plus lightweight task-specific semantic requirements."""
+    if not result["success"] or result["results"] is None:
+        return False, [result["error"] or "SQL did not execute"]
+
+    failures: list[str] = []
+    expected_rows = question.get("expected_rows")
+    actual_rows = len(result["results"])
+    if expected_rows is not None and actual_rows != expected_rows:
+        failures.append(f"expected {expected_rows} rows, got {actual_rows}")
+
+    normalized_sql = (result["sql"] or "").lower()
+    missing_terms = [
+        term for term in question.get("required_sql_terms", [])
+        if term.lower() not in normalized_sql
+    ]
+    if missing_terms:
+        failures.append(f"SQL omitted required concepts: {', '.join(missing_terms)}")
+
+    if result.get("truncated"):
+        failures.append("result exceeded the configured row limit")
+
+    return not failures, failures
+
 
 def run_tests(
     questions: list[dict],
@@ -195,9 +224,13 @@ def run_tests(
         )
 
         row_count = len(result["results"]) if result["success"] and result["results"] is not None else None
-        status = "[PASS]" if result["success"] else "[FAIL]"
+        passed, evaluation_errors = evaluate_result(q, result)
+        status = "[PASS]" if passed else "[FAIL]"
 
-        print(f"         {status} | Attempts: {result['attempts']} | Rows returned: {row_count}")
+        print(
+            f"         {status} | Executed: {result['success']} | "
+            f"Attempts: {result['attempts']} | Rows returned: {row_count}"
+        )
 
         if result["success"] and result["results"] is not None and not result["results"].empty:
             # Show first 3 rows inline
@@ -207,6 +240,9 @@ def run_tests(
             for line in preview_str.split("\n"):
                 print(f"         {line}")
 
+        if evaluation_errors:
+            for evaluation_error in evaluation_errors:
+                print(f"         Evaluation: {evaluation_error}")
         if not result["success"]:
             print(f"         Error: {result['error']}")
             if result["sql"]:
@@ -219,19 +255,67 @@ def run_tests(
             "tier": q["tier"],
             "question": q["question"],
             "success": result["success"],
+            "passed": passed,
             "attempts": result["attempts"],
             "row_count": row_count,
+            "truncated": result.get("truncated", False),
             "sql": result["sql"] or "",
-            "error": result["error"] or "",
+            "error": result["error"] or "; ".join(evaluation_errors),
         })
 
     return results
 
 
+def run_security_tests(conn: sqlite3.Connection) -> bool:
+    """Run negative security and structural isolation tests."""
+    print(f"\n{'='*70}")
+    print("  DataTell Phase 2 -- Security & Execution Isolation Suite")
+    print(f"{'='*70}\n")
+
+    cases = [
+        ("DROP TABLE attack", "DROP TABLE orders;", False),
+        ("Comment trick attack", "-- SELECT\nDROP TABLE orders;", False),
+        ("Multi-statement attack", "SELECT * FROM orders; DROP TABLE customers;", False),
+        ("CTE write attempt", "WITH d AS (DELETE FROM orders) SELECT * FROM d;", False),
+        ("PRAGMA write attempt", "PRAGMA writable_schema = ON;", False),
+        ("Valid read-only CTE", "WITH cat AS (SELECT product_id FROM products) SELECT * FROM cat LIMIT 2;", True),
+    ]
+
+    all_passed = True
+    for name, sql, expected_valid in cases:
+        try:
+            validate_select_only(sql)
+            is_valid = True
+            error = None
+        except ValueError as exc:
+            is_valid = False
+            error = str(exc)
+
+        passed = (is_valid == expected_valid)
+        if not passed:
+            all_passed = False
+        status = "[PASS]" if passed else "[FAIL]"
+        print(f"  {status} {name}: expected valid={expected_valid}, got valid={is_valid}")
+        if error and not expected_valid:
+            print(f"         Blocked with message: {error}")
+
+    # Test SQLite authorizer enforcement directly
+    print("\n  Testing SQLite Authorizer runtime enforcement...")
+    try:
+        execute_sql("DELETE FROM orders", conn)
+        print("  [FAIL] SQLite authorizer failed to block DELETE")
+        all_passed = False
+    except Exception as exc:
+        print(f"  [PASS] SQLite authorizer successfully blocked write: {exc}")
+
+    print(f"\n{'='*70}\n")
+    return all_passed
+
+
 def print_summary(results: list[dict]) -> None:
     """Print pass/fail summary broken down by tier."""
     total = len(results)
-    passed = sum(1 for r in results if r["success"])
+    passed = sum(1 for r in results if r["passed"])
     failed = total - passed
     avg_attempts = sum(r["attempts"] for r in results) / total if total else 0
 
@@ -246,7 +330,7 @@ def print_summary(results: list[dict]) -> None:
 
     for tier in ["easy", "medium", "hard"]:
         tier_results = [r for r in results if r["tier"] == tier]
-        tier_pass = sum(1 for r in tier_results if r["success"])
+        tier_pass = sum(1 for r in tier_results if r["passed"])
         tier_total = len(tier_results)
         badge = {"easy": "[E]", "medium": "[M]", "hard": "[H]"}[tier]
         print(f"  {badge} {tier.upper():6s}: {tier_pass}/{tier_total} passed")
@@ -256,7 +340,7 @@ def print_summary(results: list[dict]) -> None:
     if failed > 0:
         print("  Failed questions:")
         for r in results:
-            if not r["success"]:
+            if not r["passed"]:
                 print(f"    [{r['id']:02d}] {r['question'][:70]}")
                 print(f"         Error: {r['error'][:100]}")
         print()
@@ -265,7 +349,10 @@ def print_summary(results: list[dict]) -> None:
 def save_results(results: list[dict], out_path: Path) -> None:
     """Save results to CSV for future reference."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["id", "tier", "question", "success", "attempts", "row_count", "sql", "error"]
+    fieldnames = [
+        "id", "tier", "question", "success", "passed", "attempts", "row_count",
+        "truncated", "sql", "error",
+    ]
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -286,6 +373,11 @@ if __name__ == "__main__":
         help="Which tier of questions to run (default: all)",
     )
     parser.add_argument(
+        "--security-only",
+        action="store_true",
+        help="Run security & execution isolation test suite only",
+    )
+    parser.add_argument(
         "--model",
         default="gemini-3.5-flash",
         help="Gemini model to use (default: gemini-3.5-flash)",
@@ -302,6 +394,13 @@ if __name__ == "__main__":
 
     conn = sqlite3.connect(DB_PATH)
     schema = get_schema(conn)
+
+    if args.security_only:
+        success = run_security_tests(conn)
+        sys.exit(0 if success else 1)
+
+    # Always run security checks first
+    run_security_tests(conn)
 
     questions = TEST_QUESTIONS if args.tier == "all" else [
         q for q in TEST_QUESTIONS if q["tier"] == args.tier

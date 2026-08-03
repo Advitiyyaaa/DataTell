@@ -28,15 +28,71 @@ source_config schema:
     }
 """
 
+import os
 import sqlite3
+import uuid
 import pandas as pd
 from pathlib import Path
-from typing import Callable
 
 
 # ---------------------------------------------------------------------------
 # Core loader — source_config-driven, nothing hardcoded
 # ---------------------------------------------------------------------------
+
+def _key_columns(cfg: dict) -> list[str]:
+    """Return the configured unique key, including composite keys."""
+    if cfg.get("key_columns"):
+        return list(cfg["key_columns"])
+    return [cfg["pk"]] if cfg.get("pk") else []
+
+
+def _quote_identifier(identifier: str) -> str:
+    """Quote a SQLite identifier after it has been validated against config."""
+    return "[" + identifier.replace("]", "]]" ) + "]"
+
+
+def _validate_relationships(frames: dict[str, pd.DataFrame], relationships: list[dict]) -> None:
+    """Raise if a configured child key has no corresponding parent key."""
+    for relationship in relationships:
+        child_table = relationship["child_table"]
+        child_column = relationship["child_column"]
+        parent_table = relationship["parent_table"]
+        parent_column = relationship["parent_column"]
+
+        child_values = frames[child_table][child_column].dropna()
+        parent_values = set(frames[parent_table][parent_column].dropna())
+        orphan_count = int((~child_values.isin(parent_values)).sum())
+        if orphan_count:
+            raise ValueError(
+                f"Referential-integrity check failed: {orphan_count:,} values in "
+                f"{child_table}.{child_column} have no match in "
+                f"{parent_table}.{parent_column}."
+            )
+
+
+def _create_configured_indexes(
+    conn: sqlite3.Connection,
+    frames: dict[str, pd.DataFrame],
+    source_config: dict,
+) -> None:
+    """Create indexes declared in config after all tables have been loaded."""
+    for table_name, cfg in source_config["tables"].items():
+        if table_name not in frames:
+            continue  # Helper tables may have been consumed by a transform.
+
+        for columns in cfg.get("indexes", []):
+            if isinstance(columns, str):
+                columns = [columns]
+            if not columns or any(col not in frames[table_name].columns for col in columns):
+                raise ValueError(f"Invalid index configuration for table '{table_name}': {columns}")
+
+            index_name = f"idx_{table_name}_{'_'.join(columns)}"
+            quoted_columns = ", ".join(_quote_identifier(col) for col in columns)
+            conn.execute(
+                f"CREATE INDEX IF NOT EXISTS {_quote_identifier(index_name)} "
+                f"ON {_quote_identifier(table_name)} ({quoted_columns})"
+            )
+
 
 def load_data(source_config: dict) -> sqlite3.Connection:
     """
@@ -61,7 +117,20 @@ def load_data(source_config: dict) -> sqlite3.Connection:
     print("Loading CSVs...")
     frames: dict[str, pd.DataFrame] = {}
     for table_name, cfg in source_config["tables"].items():
-        df = pd.read_csv(cfg["path"])
+        csv_path = Path(cfg["path"])
+        if not csv_path.exists():
+            raise FileNotFoundError(f"Missing source file for '{table_name}': {csv_path}")
+
+        df = pd.read_csv(csv_path)
+
+        required_columns = set(cfg.get("required_columns", []))
+        required_columns.update(cfg.get("date_cols", []))
+        required_columns.update(_key_columns(cfg))
+        missing_columns = sorted(required_columns - set(df.columns))
+        if missing_columns:
+            raise ValueError(
+                f"Source '{table_name}' is missing configured columns: {missing_columns}"
+            )
 
         # Parse date columns (they arrive as strings from CSV)
         for col in cfg.get("date_cols", []):
@@ -70,54 +139,71 @@ def load_data(source_config: dict) -> sqlite3.Connection:
         frames[table_name] = df
         print(f"  Loaded {table_name}: {len(df):,} rows")
 
-    # 2. Apply dataset-specific transforms (merges, derivations, etc.)
+    # 2. Drop rows missing configured unique keys and remove duplicate keys.
+    print("\nCleaning...")
+    for table_name, cfg in source_config["tables"].items():
+        key_columns = _key_columns(cfg)
+        if not key_columns:
+            continue
+
+        before = len(frames[table_name])
+        frames[table_name] = frames[table_name].dropna(subset=key_columns)
+        dropped = before - len(frames[table_name])
+        if dropped:
+            print(f"  {table_name}: dropped {dropped} rows with null key {key_columns}")
+
+        duplicates = int(frames[table_name].duplicated(subset=key_columns).sum())
+        if duplicates:
+            print(
+                f"  {table_name}.{key_columns}: {duplicates} duplicate keys found "
+                "— deduplicating (keeping first)"
+            )
+            frames[table_name] = frames[table_name].drop_duplicates(
+                subset=key_columns, keep="first"
+            )
+
+    # 3. Audit nulls — document instead of blindly dropping.
+    print("\nNull counts per table:")
+    for name, df in frames.items():
+        nulls = {col: int(n) for col, n in df.isnull().sum().items() if n > 0}
+        print(f"  {name}: {nulls if nulls else 'no nulls'}")
+
+    # 4. Apply dataset-specific transforms after raw-key validation.
     print("\nApplying transforms...")
     for transform_fn in source_config.get("transforms", []):
         frames = transform_fn(frames)
 
-    # 3. Drop rows missing primary keys (data integrity baseline)
-    print("\nCleaning...")
-    for table_name, cfg in source_config["tables"].items():
-        pk = cfg.get("pk")
-        if pk and pk in frames[table_name].columns:
-            before = len(frames[table_name])
-            frames[table_name] = frames[table_name].dropna(subset=[pk])
-            dropped = before - len(frames[table_name])
-            if dropped:
-                print(f"  {table_name}: dropped {dropped} rows with null PK '{pk}'")
+    # 5. Verify configured relationships before publishing the database.
+    print("\nReferential-integrity checks...")
+    _validate_relationships(frames, source_config.get("relationships", []))
+    print("  All configured relationships are valid")
 
-    # 4. Audit nulls — document instead of blindly dropping
-    # Remaining nulls are expected (e.g. undelivered orders have no delivery date)
-    print("\nNull counts per table:")
-    for name, df in frames.items():
-        nulls = {col: int(n) for col, n in df.isnull().sum().items() if n > 0}
-        if nulls:
-            print(f"  {name}: {nulls}")
-        else:
-            print(f"  {name}: no nulls")
+    # 6. Write a temporary database, then atomically publish it only on success.
+    temp_db_path = db_path.with_name(
+        f".{db_path.stem}.{uuid.uuid4().hex}.tmp{db_path.suffix}"
+    )
+    conn: sqlite3.Connection | None = None
+    try:
+        print(f"\nWriting temporary SQLite database -> {temp_db_path.name}")
+        conn = sqlite3.connect(temp_db_path)
+        for table_name, df in frames.items():
+            df.to_sql(table_name, conn, if_exists="replace", index=False)
+            print(f"  Wrote {table_name}: {len(df):,} rows")
 
-    # 5. Duplicate primary-key check — deduplicate if any found
-    print("\nDuplicate key checks:")
-    for table_name, cfg in source_config["tables"].items():
-        pk = cfg.get("pk")
-        if pk and pk in frames[table_name].columns:
-            dupes = frames[table_name][pk].duplicated().sum()
-            if dupes:
-                print(f"  {table_name}.{pk}: {dupes} duplicates found — deduplicating (keeping first)")
-                frames[table_name] = frames[table_name].drop_duplicates(subset=[pk], keep="first")
-            else:
-                print(f"  {table_name}.{pk}: clean")
+        _create_configured_indexes(conn, frames, source_config)
+        conn.commit()
+    except Exception:
+        if conn is not None:
+            conn.close()
+        if temp_db_path.exists():
+            temp_db_path.unlink()
+        raise
+    else:
+        conn.close()
 
-    # 6. Write to SQLite
-    print(f"\nWriting to SQLite -> {db_path}")
-    conn = sqlite3.connect(db_path)
-    for table_name, df in frames.items():
-        df.to_sql(table_name, conn, if_exists="replace", index=False)
-        print(f"  Wrote {table_name}: {len(df):,} rows")
-
-    conn.commit()
-    print(f"\nDone. Database written to {db_path}")
-    return conn
+    os.replace(temp_db_path, db_path)
+    print(f"\nDone. Database atomically written to {db_path}")
+    return sqlite3.connect(db_path)
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +247,7 @@ OLIST_SOURCE_CONFIG = {
             "path": RAW_DIR / "olist_customers_dataset.csv",
             "pk": "customer_id",
             "date_cols": [],
+            "indexes": [["customer_id"], ["customer_unique_id"]],
         },
         "orders": {
             "path": RAW_DIR / "olist_orders_dataset.csv",
@@ -172,40 +259,56 @@ OLIST_SOURCE_CONFIG = {
                 "order_delivered_customer_date",
                 "order_estimated_delivery_date",
             ],
+            "indexes": [["order_id"], ["customer_id"], ["order_purchase_timestamp"]],
         },
         "order_items": {
             "path": RAW_DIR / "olist_order_items_dataset.csv",
-            "pk": None,  # composite key (order_id + order_item_id), checked via verify_db.py
-            "date_cols": [],
+            "pk": None,
+            "key_columns": ["order_id", "order_item_id"],
+            "date_cols": ["shipping_limit_date"],
+            "indexes": [["order_id"], ["product_id"], ["seller_id"]],
         },
         "payments": {
             "path": RAW_DIR / "olist_order_payments_dataset.csv",
             "pk": None,
+            "key_columns": ["order_id", "payment_sequential"],
             "date_cols": [],
+            "indexes": [["order_id"], ["payment_type"]],
         },
         "reviews": {
             "path": RAW_DIR / "olist_order_reviews_dataset.csv",
             "pk": "review_id",
             "date_cols": ["review_creation_date", "review_answer_timestamp"],
+            "indexes": [["review_id"], ["order_id"]],
         },
         "products": {
             "path": RAW_DIR / "olist_products_dataset.csv",
             "pk": "product_id",
             "date_cols": [],
+            "indexes": [["product_id"], ["product_category_name_english"]],
         },
         "sellers": {
             "path": RAW_DIR / "olist_sellers_dataset.csv",
             "pk": "seller_id",
             "date_cols": [],
+            "indexes": [["seller_id"]],
         },
         # Helper table — consumed by transform, not written to DB
         "category_translation": {
             "path": RAW_DIR / "product_category_name_translation.csv",
-            "pk": None,
+            "pk": "product_category_name",
             "date_cols": [],
         },
     },
     "transforms": [_translate_product_categories],
+    "relationships": [
+        {"child_table": "orders", "child_column": "customer_id", "parent_table": "customers", "parent_column": "customer_id"},
+        {"child_table": "order_items", "child_column": "order_id", "parent_table": "orders", "parent_column": "order_id"},
+        {"child_table": "order_items", "child_column": "product_id", "parent_table": "products", "parent_column": "product_id"},
+        {"child_table": "order_items", "child_column": "seller_id", "parent_table": "sellers", "parent_column": "seller_id"},
+        {"child_table": "reviews", "child_column": "order_id", "parent_table": "orders", "parent_column": "order_id"},
+        {"child_table": "payments", "child_column": "order_id", "parent_table": "orders", "parent_column": "order_id"},
+    ],
 }
 
 

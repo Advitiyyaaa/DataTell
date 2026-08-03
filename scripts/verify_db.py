@@ -1,99 +1,162 @@
-"""
-Phase 1 - DB Verification Script
-Quick sanity checks on analytics.db after load_data.py has run.
-"""
+"""Phase 1 database verification with enforceable data-quality checks."""
 
 import sqlite3
-import pandas as pd
 from pathlib import Path
 
-DB_PATH = Path("db/analytics.db")
+import pandas as pd
 
-conn = sqlite3.connect(DB_PATH)
 
-print("=== Tables in analytics.db ===")
-tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table';", conn)
-print(tables.to_string(index=False))
-print()
+DB_PATH = Path(__file__).parent.parent / "db" / "analytics.db"
 
-print("=== Row counts & columns ===")
-for t in tables["name"]:
-    count = pd.read_sql(f"SELECT COUNT(*) as cnt FROM [{t}]", conn).iloc[0, 0]
-    cols = pd.read_sql(f"PRAGMA table_info([{t}])", conn)["name"].tolist()
-    print(f"  {t}: {count:,} rows")
-    print(f"    cols: {cols}")
-print()
+EXPECTED_ROW_COUNTS = {
+    "customers": 99_441,
+    "orders": 99_441,
+    "order_items": 112_650,
+    "payments": 103_886,
+    "reviews": 98_410,
+    "products": 32_951,
+    "sellers": 3_095,
+}
 
-print("=== Test Query 1: Order status breakdown with avg price ===")
-q1 = pd.read_sql("""
-    SELECT o.order_status,
-           COUNT(*) as order_count,
-           ROUND(AVG(oi.price), 2) as avg_item_price
-    FROM orders o
-    JOIN order_items oi ON o.order_id = oi.order_id
-    GROUP BY o.order_status
-    ORDER BY order_count DESC
-""", conn)
-print(q1.to_string(index=False))
-print()
+KEYS = {
+    "customers": ["customer_id"],
+    "orders": ["order_id"],
+    "order_items": ["order_id", "order_item_id"],
+    "payments": ["order_id", "payment_sequential"],
+    "reviews": ["review_id"],
+    "products": ["product_id"],
+    "sellers": ["seller_id"],
+}
 
-print("=== Test Query 2: Top 5 product categories by revenue ===")
-q2 = pd.read_sql("""
-    SELECT p.product_category_name_english as category,
-           COUNT(oi.order_id) as items_sold,
-           ROUND(SUM(oi.price), 2) as total_revenue
-    FROM order_items oi
-    JOIN products p ON oi.product_id = p.product_id
-    WHERE p.product_category_name_english IS NOT NULL
-    GROUP BY category
-    ORDER BY total_revenue DESC
-    LIMIT 5
-""", conn)
-print(q2.to_string(index=False))
-print()
+RELATIONSHIPS = [
+    ("orders", "customer_id", "customers", "customer_id"),
+    ("order_items", "order_id", "orders", "order_id"),
+    ("order_items", "product_id", "products", "product_id"),
+    ("order_items", "seller_id", "sellers", "seller_id"),
+    ("reviews", "order_id", "orders", "order_id"),
+    ("payments", "order_id", "orders", "order_id"),
+]
 
-print("=== Test Query 3: Orders with customer city ===")
-q3 = pd.read_sql("""
-    SELECT o.order_id,
-           o.order_status,
-           c.customer_city,
-           c.customer_state,
-           o.order_purchase_timestamp
-    FROM orders o
-    JOIN customers c ON o.customer_id = c.customer_id
-    LIMIT 5
-""", conn)
-print(q3.to_string(index=False))
-print()
 
-print("=== Test Query 4: Avg review score per seller ===")
-q4 = pd.read_sql("""
-    SELECT s.seller_id,
-           s.seller_city,
-           ROUND(AVG(r.review_score), 2) as avg_score,
-           COUNT(r.review_id) as review_count
-    FROM sellers s
-    JOIN order_items oi ON s.seller_id = oi.seller_id
-    JOIN reviews r ON oi.order_id = r.order_id
-    GROUP BY s.seller_id, s.seller_city
-    ORDER BY avg_score DESC
-    LIMIT 5
-""", conn)
-print(q4.to_string(index=False))
-print()
+def _quote_identifier(identifier: str) -> str:
+    return "[" + identifier.replace("]", "]]" ) + "]"
 
-print("=== Test Query 5: Payment method breakdown ===")
-q5 = pd.read_sql("""
-    SELECT payment_type,
-           COUNT(*) as transactions,
-           ROUND(SUM(payment_value), 2) as total_value,
-           ROUND(AVG(payment_value), 2) as avg_value
-    FROM payments
-    GROUP BY payment_type
-    ORDER BY transactions DESC
-""", conn)
-print(q5.to_string(index=False))
-print()
 
-conn.close()
-print("All verification queries passed.")
+def _assert(condition: bool, message: str) -> None:
+    if not condition:
+        raise AssertionError(message)
+
+
+def _count(conn: sqlite3.Connection, table_name: str) -> int:
+    return int(
+        pd.read_sql(f"SELECT COUNT(*) AS cnt FROM {_quote_identifier(table_name)}", conn)
+        .iloc[0, 0]
+    )
+
+
+def verify_database(conn: sqlite3.Connection) -> None:
+    """Validate schema shape, keys, relationships, and analytical smoke queries."""
+    tables = pd.read_sql(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name", conn
+    )["name"].tolist()
+    actual_tables = set(tables)
+    expected_tables = set(EXPECTED_ROW_COUNTS)
+    _assert(
+        actual_tables == expected_tables,
+        f"Unexpected tables. Expected {sorted(expected_tables)}, got {sorted(actual_tables)}",
+    )
+
+    print("=== Row-count checks ===")
+    for table_name, expected_count in EXPECTED_ROW_COUNTS.items():
+        actual_count = _count(conn, table_name)
+        _assert(
+            actual_count == expected_count,
+            f"{table_name}: expected {expected_count:,} rows, got {actual_count:,}",
+        )
+        print(f"  PASS {table_name}: {actual_count:,} rows")
+
+    print("\n=== Key integrity checks ===")
+    for table_name, key_columns in KEYS.items():
+        quoted_columns = ", ".join(_quote_identifier(column) for column in key_columns)
+        null_predicate = " OR ".join(
+            f"{_quote_identifier(column)} IS NULL" for column in key_columns
+        )
+        null_count = int(
+            pd.read_sql(
+                f"SELECT COUNT(*) AS cnt FROM {_quote_identifier(table_name)} "
+                f"WHERE {null_predicate}",
+                conn,
+            ).iloc[0, 0]
+        )
+        duplicate_count = int(
+            pd.read_sql(
+                f"SELECT COUNT(*) AS cnt FROM ("
+                f"SELECT {quoted_columns}, COUNT(*) AS n "
+                f"FROM {_quote_identifier(table_name)} "
+                f"GROUP BY {quoted_columns} HAVING n > 1"
+                f")",
+                conn,
+            ).iloc[0, 0]
+        )
+        _assert(null_count == 0, f"{table_name}: {null_count} null key rows")
+        _assert(duplicate_count == 0, f"{table_name}: {duplicate_count} duplicate keys")
+        print(f"  PASS {table_name}: non-null, unique {key_columns}")
+
+    print("\n=== Referential-integrity checks ===")
+    for child_table, child_column, parent_table, parent_column in RELATIONSHIPS:
+        orphan_count = int(
+            pd.read_sql(
+                f"SELECT COUNT(*) AS cnt "
+                f"FROM {_quote_identifier(child_table)} child "
+                f"LEFT JOIN {_quote_identifier(parent_table)} parent "
+                f"ON child.{_quote_identifier(child_column)} = parent.{_quote_identifier(parent_column)} "
+                f"WHERE child.{_quote_identifier(child_column)} IS NOT NULL "
+                f"AND parent.{_quote_identifier(parent_column)} IS NULL",
+                conn,
+            ).iloc[0, 0]
+        )
+        _assert(
+            orphan_count == 0,
+            f"{child_table}.{child_column}: {orphan_count} orphan foreign keys",
+        )
+        print(f"  PASS {child_table}.{child_column} -> {parent_table}.{parent_column}")
+
+    print("\n=== Analytical smoke checks ===")
+    checks = {
+        "order status breakdown": """
+            SELECT order_status, COUNT(*) AS order_count
+            FROM orders
+            GROUP BY order_status
+        """,
+        "category revenue": """
+            SELECT p.product_category_name_english, SUM(oi.price) AS total_revenue
+            FROM order_items oi
+            JOIN products p ON oi.product_id = p.product_id
+            WHERE p.product_category_name_english IS NOT NULL
+            GROUP BY p.product_category_name_english
+            ORDER BY total_revenue DESC
+            LIMIT 5
+        """,
+        "payment breakdown": """
+            SELECT payment_type, COUNT(*) AS payment_count
+            FROM payments
+            GROUP BY payment_type
+        """,
+    }
+    for name, query in checks.items():
+        result = pd.read_sql(query, conn)
+        _assert(not result.empty, f"Analytical smoke check returned no rows: {name}")
+        print(f"  PASS {name}: {len(result)} rows")
+
+
+if __name__ == "__main__":
+    if not DB_PATH.exists():
+        raise FileNotFoundError(f"Database not found: {DB_PATH}. Run load_data.py first.")
+
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    try:
+        verify_database(conn)
+    finally:
+        conn.close()
+
+    print("\nAll database verification checks passed.")

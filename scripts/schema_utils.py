@@ -77,14 +77,14 @@ def get_schema(conn: sqlite3.Connection) -> dict:
     return schema
 
 
-def format_schema_for_prompt(schema: dict) -> str:
+def format_schema_for_prompt(schema: dict, include_sample_rows: bool = False) -> str:
     """
     Convert the schema dict into a compact, LLM-readable string.
 
     Format per table:
         TABLE: <name> | <row_count> rows
         COLUMNS: col1(TYPE), col2(TYPE), ...
-        SAMPLE:
+        SAMPLE:  (only when include_sample_rows=True)
           col1=val, col2=val, ...
           col1=val, col2=val, ...
     """
@@ -100,8 +100,8 @@ def format_schema_for_prompt(schema: dict) -> str:
         )
         lines.append(f"COLUMNS: {col_str}")
 
-        # Sample rows
-        if info["sample_rows"]:
+        # Raw sample values can include PII. Keep them opt-in for trusted local data.
+        if include_sample_rows and info["sample_rows"]:
             lines.append("SAMPLE:")
             for row in info["sample_rows"]:
                 row_str = ", ".join(f"{k}={v!r}" for k, v in row.items())

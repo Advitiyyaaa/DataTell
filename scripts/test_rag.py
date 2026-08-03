@@ -25,6 +25,7 @@ from rag_pipeline import (
     hybrid_search,
     vector_search,
     bm25_search,
+    _has_sufficient_evidence,
 )
 
 DOCS_DIR = Path(__file__).parent.parent / "docs"
@@ -41,60 +42,78 @@ TEST_QUESTIONS = [
         "question": "What is the return window for defective products?",
         "expected_sources": ["return_policy.md"],
         "key_fact": "30 calendar days",
+        "evidence_terms": ["30 calendar days"],
     },
     {
         "id": 2,
         "question": "How long does standard delivery take to remote areas?",
         "expected_sources": ["shipping_policy.md"],
         "key_fact": "8 to 15 business days",
+        "evidence_terms": ["8 to 15 business days"],
     },
     {
         "id": 3,
         "question": "What payment methods does Olist accept?",
         "expected_sources": ["customer_faq.md"],
         "key_fact": "credit card, boleto, debit card, PIX, vouchers",
+        "evidence_terms": ["credit card", "boleto", "debit card", "pix", "vouchers"],
     },
     {
         "id": 4,
         "question": "What review score must sellers maintain to stay active on the platform?",
         "expected_sources": ["seller_guidelines.md"],
         "key_fact": "3.5 minimum",
+        "evidence_terms": ["minimum acceptable", "3.5"],
     },
     {
         "id": 5,
         "question": "Can I cancel an order after it has already been shipped?",
         "expected_sources": ["customer_faq.md"],
         "key_fact": "No — once dispatched, cancellation is not possible",
+        "evidence_terms": ["once dispatched", "cancellation is no longer possible"],
     },
     {
         "id": 6,
         "question": "What are the conditions for returning a purchased item?",
         "expected_sources": ["return_policy.md"],
         "key_fact": "unused, original packaging, within 7 days",
+        "evidence_terms": ["unused", "original packaging", "7 calendar days"],
     },
     {
         "id": 7,
         "question": "Within how many business days must sellers dispatch orders?",
         "expected_sources": ["shipping_policy.md", "seller_guidelines.md"],
         "key_fact": "3 business days",
+        "evidence_terms": ["3 business days"],
     },
     {
         "id": 8,
         "question": "What happens to sellers with consistently low review scores?",
         "expected_sources": ["seller_guidelines.md"],
         "key_fact": "suspension below 3.0 or below 3.5 for 60 days",
+        "evidence_terms": ["below 3.0", "below 3.5", "60 consecutive days"],
     },
     {
         "id": 9,
         "question": "How is a boleto refund processed and how long does it take?",
         "expected_sources": ["return_policy.md"],
         "key_fact": "bank transfer within 5 business days",
+        "evidence_terms": ["bank transfer", "5 business days"],
     },
     {
         "id": 10,
         "question": "What legal warranty period applies to electronics under Brazilian law?",
         "expected_sources": ["return_policy.md", "customer_faq.md"],
         "key_fact": "90 days",
+        "evidence_terms": ["90 days"],
+    },
+    {
+        "id": 11,
+        "question": "Which airport offers same-day in-store pickup for Olist orders?",
+        "expected_sources": [],
+        "key_fact": "not answerable from the policy corpus",
+        "evidence_terms": [],
+        "expected_answerable": False,
     },
 ]
 
@@ -102,6 +121,27 @@ TEST_QUESTIONS = [
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
+
+def _normalize(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def _first_evidence_rank(retrieved: list[dict], question: dict) -> int | None:
+    """Return the one-based rank of a chunk with the required source and evidence."""
+    expected_sources = set(question["expected_sources"])
+    evidence_terms = [_normalize(term) for term in question.get("evidence_terms", [])]
+    for rank, chunk in enumerate(retrieved, 1):
+        source_matches = chunk["metadata"].get("source") in expected_sources
+        text = _normalize(chunk["text"])
+        if source_matches and all(term in text for term in evidence_terms):
+            return rank
+    return None
+
+
+def _answer_has_evidence(answer: str, question: dict) -> bool:
+    evidence_terms = [_normalize(term) for term in question.get("evidence_terms", [])]
+    return all(term in _normalize(answer) for term in evidence_terms)
+
 
 def run_rag_tests(
     collection,
@@ -133,15 +173,24 @@ def run_rag_tests(
         if retrieval_only:
             retrieved = hybrid_search(q["question"], collection, bm25, chunks, k=4)
             sources = sorted(set(c["metadata"].get("source", "?") for c in retrieved))
-            expected_sources = set(q["expected_sources"])
-            source_hit = bool(set(sources) & expected_sources)
-            status = "[PASS]" if source_hit else "[MISS]"
+            expected_answerable = q.get("expected_answerable", True)
+            evidence_rank = _first_evidence_rank(retrieved, q) if expected_answerable else None
+            evidence_hit = evidence_rank is not None
+            answerable = _has_sufficient_evidence(retrieved, min_vector_score=0.25)
+            passed = evidence_hit if expected_answerable else not answerable
+            status = "[PASS]" if passed else "[MISS]"
             print(f"         {status} | Retrieved sources: {sources}")
-            print(f"         Expected sources : {q['expected_sources']}")
-            print(f"         Top chunk: {retrieved[0]['text'][:120].replace(chr(10), ' ')}...\n")
+            print(f"         Evidence rank   : {evidence_rank or 'not retrieved'}")
+            if retrieved:
+                print(f"         Top chunk: {retrieved[0]['text'][:120].replace(chr(10), ' ')}...\n")
+            else:
+                print("         Top chunk: none\n")
             results.append({
                 "id": q["id"], "question": q["question"],
-                "status": status, "source_hit": source_hit, "fact_hit": False,
+                "status": status, "source_hit": evidence_hit, "fact_hit": False,
+                "evidence_hit": evidence_hit, "evidence_rank": evidence_rank,
+                "answerable": answerable,
+                "expected_answerable": expected_answerable,
                 "sources": sources, "retrieval_ms": 0, "generation_ms": 0,
                 "answer_snippet": "[retrieval only mode]",
             })
@@ -166,6 +215,10 @@ def run_rag_tests(
                 "status": "[ERROR]",
                 "source_hit": False,
                 "fact_hit": False,
+                "evidence_hit": False,
+                "evidence_rank": None,
+                "answerable": None,
+                "expected_answerable": q.get("expected_answerable", True),
                 "sources": [],
                 "retrieval_ms": 0,
                 "generation_ms": 0,
@@ -175,19 +228,17 @@ def run_rag_tests(
             time.sleep(15)
             continue
 
-        # Check if expected sources were retrieved
-        retrieved_sources = set(result["sources"])
-        expected_sources = set(q["expected_sources"])
-        source_hit = bool(retrieved_sources & expected_sources)
-
-        # Check if key fact appears in answer (simple heuristic)
-        key_terms = q["key_fact"].lower().split()
-        answer_lower = result["answer"].lower()
-        fact_hit = sum(1 for t in key_terms if t in answer_lower) >= len(key_terms) // 2
-
-        status = "[PASS]" if (source_hit and fact_hit) else "[PARTIAL]" if source_hit else "[MISS]"
+        expected_answerable = q.get("expected_answerable", True)
+        evidence_rank = _first_evidence_rank(result["chunks"], q) if expected_answerable else None
+        evidence_hit = evidence_rank is not None
+        fact_hit = _answer_has_evidence(result["answer"], q) if expected_answerable else not result["answerable"]
+        if expected_answerable:
+            status = "[PASS]" if (evidence_hit and fact_hit) else "[PARTIAL]" if evidence_hit else "[MISS]"
+        else:
+            status = "[PASS]" if not result["answerable"] else "[MISS]"
 
         print(f"         {status} | Sources: {result['sources']}")
+        print(f"         Evidence rank: {evidence_rank or 'not retrieved'} | Answerable: {result['answerable']}")
         print(f"         Timing: retrieval={result['retrieval_ms']}ms | generation={result['generation_ms']}ms")
         print(f"\n         Answer:\n         {result['answer'][:400]}{'...' if len(result['answer']) > 400 else ''}\n")
 
@@ -195,8 +246,12 @@ def run_rag_tests(
             "id": q["id"],
             "question": q["question"],
             "status": status,
-            "source_hit": source_hit,
+            "source_hit": evidence_hit,
             "fact_hit": fact_hit,
+            "evidence_hit": evidence_hit,
+            "evidence_rank": evidence_rank,
+            "answerable": result["answerable"],
+            "expected_answerable": expected_answerable,
             "sources": result["sources"],
             "retrieval_ms": result["retrieval_ms"],
             "generation_ms": result["generation_ms"],
@@ -254,6 +309,24 @@ def print_summary(results: list[dict]) -> None:
     avg_generation = sum(r["generation_ms"] for r in results if r["generation_ms"]) / max(ran, 1)
     print(f"  Avg retrieval  : {avg_retrieval:.0f}ms")
     print(f"  Avg generation : {avg_generation:.0f}ms")
+    answerable_results = [
+        result for result in results
+        if result.get("expected_answerable", True) and result["status"] != "[ERROR]"
+    ]
+    evidence_hits = sum(result.get("evidence_hit", False) for result in answerable_results)
+    reciprocal_ranks = [
+        1 / result["evidence_rank"]
+        for result in answerable_results
+        if result.get("evidence_rank")
+    ]
+    print(
+        f"  Evidence Recall@4: {evidence_hits/max(len(answerable_results), 1)*100:.0f}% "
+        f"({evidence_hits}/{len(answerable_results)})"
+    )
+    print(
+        f"  Evidence MRR@4   : "
+        f"{sum(reciprocal_ranks)/max(len(answerable_results), 1):.3f}"
+    )
     print(f"{'='*70}\n")
 
 

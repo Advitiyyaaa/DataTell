@@ -22,6 +22,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -47,7 +48,7 @@ YOUR TASK: Given a natural language question, generate a single SQL SELECT query
 
 CRITICAL RULES — follow every one:
 1. Return ONLY the raw SQL query. No explanations, no markdown fences, no comments, no preamble.
-2. The query MUST start with SELECT. NEVER use INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, TRUNCATE, ATTACH, or PRAGMA writes.
+2. The query MUST be a single read-only SELECT statement. It may start with SELECT or WITH. NEVER use INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, TRUNCATE, ATTACH, or PRAGMA.
 3. Use standard SQLite syntax only.
 4. For date operations use SQLite functions:
    - Extract year:  strftime('%Y', col)
@@ -107,6 +108,12 @@ def extract_sql_from_response(response_text: str) -> str:
     return text
 
 
+def _strip_sql_comments(sql: str) -> str:
+    """Remove SQL comments before structural validation."""
+    without_line_comments = re.sub(r"--[^\n]*", "", sql)
+    return re.sub(r"/\*.*?\*/", "", without_line_comments, flags=re.DOTALL)
+
+
 def validate_select_only(sql: str) -> None:
     """
     Raise ValueError if the SQL is not a pure SELECT statement.
@@ -114,12 +121,16 @@ def validate_select_only(sql: str) -> None:
     Safety layer: prevents the LLM from generating write/DDL operations.
     We strip comments first so tricks like '-- SELECT\\nDROP TABLE' don't slip through.
     """
-    # Strip single-line comments
-    clean = re.sub(r"--[^\n]*", "", sql)
-    # Strip multi-line comments
-    clean = re.sub(r"/\*.*?\*/", "", clean, flags=re.DOTALL)
+    clean = _strip_sql_comments(sql).strip()
+    if clean.endswith(";"):
+        clean = clean[:-1].rstrip()
+    if not clean:
+        raise ValueError("Expected a SQL query, got an empty response.")
+    if ";" in clean:
+        raise ValueError("Safety violation: multiple SQL statements are not permitted.")
 
-    first_word = clean.strip().split()[0].upper() if clean.strip() else ""
+    match = re.match(r"([A-Za-z]+)", clean)
+    first_word = match.group(1).upper() if match else ""
 
     FORBIDDEN = {
         "INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER",
@@ -130,17 +141,80 @@ def validate_select_only(sql: str) -> None:
     if first_word in FORBIDDEN:
         raise ValueError(
             f"Safety violation: query starts with '{first_word}'. "
-            "Only SELECT statements are permitted."
+            "Only read-only SELECT statements are permitted."
         )
-    if first_word != "SELECT":
+    if first_word not in {"SELECT", "WITH"}:
         raise ValueError(
-            f"Expected query to start with SELECT, got '{first_word}'."
+            f"Expected query to start with SELECT or WITH, got '{first_word}'."
+        )
+
+    # A data-modifying CTE can begin with WITH, so reject forbidden keywords
+    # anywhere outside simple quoted string literals.
+    literal_free = re.sub(r"'(?:''|[^'])*'", "''", clean)
+    keywords = set(re.findall(r"\b[A-Za-z]+\b", literal_free.upper()))
+    disallowed = keywords & FORBIDDEN
+    if disallowed:
+        raise ValueError(
+            "Safety violation: query contains forbidden keyword(s): "
+            f"{', '.join(sorted(disallowed))}."
         )
 
 
-def execute_sql(sql: str, conn: sqlite3.Connection) -> pd.DataFrame:
-    """Execute a validated SQL query and return results as a DataFrame."""
-    return pd.read_sql(sql, conn)
+_SQLITE_WRITE_ACTIONS = {
+    getattr(sqlite3, name)
+    for name in (
+        "SQLITE_INSERT", "SQLITE_UPDATE", "SQLITE_DELETE", "SQLITE_CREATE_INDEX",
+        "SQLITE_CREATE_TABLE", "SQLITE_CREATE_TEMP_INDEX", "SQLITE_CREATE_TEMP_TABLE",
+        "SQLITE_CREATE_TEMP_TRIGGER", "SQLITE_CREATE_TEMP_VIEW", "SQLITE_CREATE_TRIGGER",
+        "SQLITE_CREATE_VIEW", "SQLITE_DROP_INDEX", "SQLITE_DROP_TABLE",
+        "SQLITE_DROP_TEMP_INDEX", "SQLITE_DROP_TEMP_TABLE", "SQLITE_DROP_TEMP_TRIGGER",
+        "SQLITE_DROP_TEMP_VIEW", "SQLITE_DROP_TRIGGER", "SQLITE_DROP_VIEW",
+        "SQLITE_ALTER_TABLE", "SQLITE_REINDEX", "SQLITE_ANALYZE", "SQLITE_ATTACH",
+        "SQLITE_DETACH", "SQLITE_PRAGMA", "SQLITE_TRANSACTION",
+    )
+    if hasattr(sqlite3, name)
+}
+
+
+def _read_only_authorizer(action_code, _arg1, _arg2, _database, _source):
+    """SQLite's final enforcement layer for generated SQL."""
+    return sqlite3.SQLITE_DENY if action_code in _SQLITE_WRITE_ACTIONS else sqlite3.SQLITE_OK
+
+
+def execute_sql(
+    sql: str,
+    conn: sqlite3.Connection,
+    max_rows: int = 1_000,
+    timeout_seconds: float = 5.0,
+) -> pd.DataFrame:
+    """Execute validated SQL with read-only authorization, timeout, and row cap."""
+    if max_rows <= 0:
+        raise ValueError("max_rows must be positive")
+
+    query = sql.strip().rstrip(";")
+    guarded_sql = f"SELECT * FROM ({query}) AS generated_query LIMIT {max_rows + 1}"
+    deadline = time.monotonic() + timeout_seconds
+
+    def abort_if_timed_out() -> int:
+        return int(time.monotonic() >= deadline)
+
+    conn.set_authorizer(_read_only_authorizer)
+    conn.set_progress_handler(abort_if_timed_out, 10_000)
+    try:
+        results = pd.read_sql(guarded_sql, conn)
+    except sqlite3.OperationalError as exc:
+        if "interrupted" in str(exc).lower():
+            raise TimeoutError(f"SQL query exceeded {timeout_seconds:.1f}s timeout") from exc
+        raise
+    finally:
+        conn.set_progress_handler(None, 0)
+        conn.set_authorizer(None)
+
+    truncated = len(results) > max_rows
+    if truncated:
+        results = results.iloc[:max_rows].copy()
+    results.attrs["truncated"] = truncated
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +227,9 @@ def nl_to_sql(
     conn: sqlite3.Connection,
     model: str = "gemini-3.5-flash",
     max_retries: int = 3,
+    max_rows: int = 1_000,
+    timeout_seconds: float = 5.0,
+    include_sample_rows: bool = False,
     verbose: bool = False,
 ) -> dict:
     """
@@ -165,6 +242,9 @@ def nl_to_sql(
     conn       : Open SQLite connection.
     model      : Gemini model name (default: gemini-2.5-flash).
     max_retries: Max LLM attempts before giving up (default: 3).
+    max_rows   : Maximum number of rows returned to the caller.
+    timeout_seconds: SQLite execution timeout enforced with a progress handler.
+    include_sample_rows: Include raw data samples in the prompt. Keep False for PII safety.
     verbose    : Print each attempt's SQL and error if True.
 
     Returns
@@ -186,7 +266,7 @@ def nl_to_sql(
     # Import here to keep schema_utils independent
     from schema_utils import format_schema_for_prompt
 
-    schema_str = format_schema_for_prompt(schema)
+    schema_str = format_schema_for_prompt(schema, include_sample_rows=include_sample_rows)
     system_prompt = _build_system_prompt(schema_str)
 
     client = genai.Client(api_key=_api_key)
@@ -260,8 +340,15 @@ def nl_to_sql(
             # Safety check
             validate_select_only(raw_sql)
 
-            # Execute
-            results = execute_sql(raw_sql, conn)
+            # Execute in a read-only, time-limited sandbox.
+            execution_started = time.monotonic()
+            results = execute_sql(
+                raw_sql,
+                conn,
+                max_rows=max_rows,
+                timeout_seconds=timeout_seconds,
+            )
+            execution_ms = round((time.monotonic() - execution_started) * 1000)
 
             return {
                 "question": question,
@@ -270,6 +357,9 @@ def nl_to_sql(
                 "attempts": attempt,
                 "success": True,
                 "error": None,
+                "row_count": len(results),
+                "truncated": bool(results.attrs.get("truncated", False)),
+                "execution_ms": execution_ms,
             }
 
         except Exception as exc:
@@ -287,6 +377,9 @@ def nl_to_sql(
         "attempts": max_retries,
         "success": False,
         "error": last_error,
+        "row_count": 0,
+        "truncated": False,
+        "execution_ms": None,
     }
 
 
