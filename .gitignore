@@ -51,6 +51,9 @@ desktop.ini
 # Interview & personal notes — NOT for public consumption
 INTERVIEW_NOTES.md
 
+# AI assistant working context — gitignored so it persists locally without polluting the repo
+AGENT_CONTEXT.md
+
 # Logs
 *.log
 logs/

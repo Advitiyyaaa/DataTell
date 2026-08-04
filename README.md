@@ -62,7 +62,7 @@ User Question (natural language)
 | 1 — Data Foundation | ✅ Done | Load, clean, verify Olist → SQLite |
 | 2 — NL→SQL Engine | ✅ Done | 20/20 test questions, 100% accuracy, avg 1.0 attempts |
 | 3 — RAG Pipeline | ✅ Done | Paragraph chunking, ChromaDB + BM25, Hybrid RRF search (100% source retrieval accuracy) |
-| 4 — Agent Router | 🔲 Next | LangGraph state machine |
+| 4 — Agent Router | ✅ Done | LangGraph state graph (22/23 test questions, 95.7% routing accuracy) |
 | 5 — Self-Check Loop | 🔲 | Second LLM pass + reasoning trace |
 | 6 — Streamlit UI | 🔲 | Chat + charts + trace panel |
 | 7 — Evaluation | 🔲 | RAGAS metrics + SQL accuracy |
