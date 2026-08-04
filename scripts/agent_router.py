@@ -25,23 +25,55 @@ Usage (from project root):
 import concurrent.futures
 import json
 import os
+import sqlite3
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from google.genai.errors import ClientError
 from langgraph.graph import StateGraph, END
 from typing_extensions import TypedDict
 
 load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
 _api_key = os.getenv("GEMINI_API_KEY")
 
+# Module-level Gemini client — instantiated once, reused across all nodes.
+# None-safe: created lazily so import doesn't fail when API key is absent.
+_client: Optional[genai.Client] = None
+
+def _get_client() -> genai.Client:
+    """Return the singleton Gemini client, creating it on first use."""
+    global _client
+    if _client is None:
+        if not _api_key:
+            raise EnvironmentError(
+                "GEMINI_API_KEY not set. Add it to .env or export it "
+                "as an environment variable."
+            )
+        _client = genai.Client(api_key=_api_key)
+    return _client
+
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
+# Ensure scripts/ is importable for sibling module imports (nl_to_sql, rag_pipeline).
+_scripts_dir = str(Path(__file__).parent)
+if _scripts_dir not in sys.path:
+    sys.path.insert(0, _scripts_dir)
+
+from nl_to_sql import nl_to_sql          # noqa: E402  (after sys.path setup)
+from rag_pipeline import rag_query       # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Default model — single constant for easy switching across all nodes.
+# Change this ONE value to swap models project-wide (quota fallback, upgrades).
+# ---------------------------------------------------------------------------
+DEFAULT_MODEL = "gemini-3.1-flash-lite"
 
 # ---------------------------------------------------------------------------
 # Agent State
@@ -100,12 +132,13 @@ CRITICAL: Respond with ONLY valid JSON -- no preamble, no markdown fences:
 """
 
 
-def _is_daily_quota_exhausted(exc_str: str) -> bool:
+def _is_daily_quota_exhausted(exc: Exception) -> bool:
     """Return True when the error is a daily (not per-minute) quota exhaustion."""
-    return "GenerateRequestsPerDayPerProjectPerModel" in exc_str or "PerDay" in exc_str
+    msg = str(exc)
+    return "GenerateRequestsPerDayPerProjectPerModel" in msg or "PerDay" in msg
 
 
-def _classify_question(question: str, model: str = "gemini-3.1-flash-lite") -> dict:
+def _classify_question(question: str, model: str = DEFAULT_MODEL) -> dict:
     """
     Call Gemini to classify the question.
     Returns {"route": str, "reasoning": str}.
@@ -114,7 +147,7 @@ def _classify_question(question: str, model: str = "gemini-3.1-flash-lite") -> d
     - Per-minute (429 without daily flag): retry with exponential backoff
     - Daily quota exhausted: raise immediately (backoff won't help)
     """
-    client = genai.Client(api_key=_api_key)
+    client = _get_client()
     for attempt in range(3):
         try:
             response = client.models.generate_content(
@@ -136,10 +169,9 @@ def _classify_question(question: str, model: str = "gemini-3.1-flash-lite") -> d
         except json.JSONDecodeError:
             if attempt == 2:
                 return {"route": "CHITCHAT", "reasoning": "Failed to parse planner response"}
-        except Exception as exc:
-            err = str(exc)
-            if "429" in err:
-                if _is_daily_quota_exhausted(err):
+        except ClientError as exc:
+            if exc.code == 429:
+                if _is_daily_quota_exhausted(exc):
                     raise RuntimeError(
                         f"Daily API quota exhausted for model '{model}'. "
                         "Wait until tomorrow or use a different model/API key."
@@ -152,6 +184,8 @@ def _classify_question(question: str, model: str = "gemini-3.1-flash-lite") -> d
                     raise
             else:
                 raise
+        except Exception:
+            raise
     return {"route": "CHITCHAT", "reasoning": "Planner exhausted retries"}
 
 
@@ -184,24 +218,25 @@ def route_after_planner(state: AgentState) -> str:
 # SQL Tool Node -- wraps nl_to_sql()
 # ---------------------------------------------------------------------------
 
-def make_sql_tool_node(conn, schema):
+def make_sql_tool_node(
+    conn, schema, model: str = DEFAULT_MODEL,
+) -> Callable[[AgentState], dict]:
     """
-    Factory capturing (conn, schema) in a closure.
+    Factory capturing (conn, schema, model) in a closure.
     Returns a LangGraph-compatible node function.
+
+    Generalisation note: `conn` and `schema` are injected at build time,
+    so swapping the underlying database (Phase 9 "any CSV") only requires
+    passing a different connection + schema — no changes to the graph.
     """
     def sql_tool_node(state: AgentState) -> dict:
-        scripts_dir = str(Path(__file__).parent)
-        if scripts_dir not in sys.path:
-            sys.path.insert(0, scripts_dir)
-        from nl_to_sql import nl_to_sql
-
         t0 = time.time()
         try:
             result = nl_to_sql(
                 state["question"],
                 schema,
                 conn,
-                model="gemini-3.1-flash-lite",
+                model=model,
                 max_retries=3,
                 verbose=False,
             )
@@ -226,17 +261,18 @@ def make_sql_tool_node(conn, schema):
 # RAG Tool Node -- wraps rag_query()
 # ---------------------------------------------------------------------------
 
-def make_rag_tool_node(collection, bm25, chunks):
+def make_rag_tool_node(
+    collection, bm25, chunks, model: str = DEFAULT_MODEL,
+) -> Callable[[AgentState], dict]:
     """
-    Factory capturing (collection, bm25, chunks) in a closure.
+    Factory capturing (collection, bm25, chunks, model) in a closure.
     Returns a LangGraph-compatible node function.
+
+    Generalisation note: the RAG index is injected at build time.
+    Swapping the document corpus only requires rebuilding the index
+    and passing the new (collection, bm25, chunks) triple.
     """
     def rag_tool_node(state: AgentState) -> dict:
-        scripts_dir = str(Path(__file__).parent)
-        if scripts_dir not in sys.path:
-            sys.path.insert(0, scripts_dir)
-        from rag_pipeline import rag_query
-
         t0 = time.time()
         try:
             result = rag_query(
@@ -244,7 +280,7 @@ def make_rag_tool_node(collection, bm25, chunks):
                 collection,
                 bm25,
                 chunks,
-                model="gemini-3.1-flash-lite",
+                model=model,
                 k=5,
                 verbose=False,
             )
@@ -267,7 +303,11 @@ def make_rag_tool_node(collection, bm25, chunks):
 # Both Tools Node -- parallel SQL + RAG for compound queries
 # ---------------------------------------------------------------------------
 
-def make_both_tools_node(conn, schema, collection, bm25, chunks, db_path: Optional[Path] = None):
+def make_both_tools_node(
+    conn, schema, collection, bm25, chunks,
+    model: str = DEFAULT_MODEL,
+    db_path: Optional[Path] = None,
+) -> Callable[[AgentState], dict]:
     """
     Factory: runs SQL and RAG concurrently via ThreadPoolExecutor.
 
@@ -279,17 +319,15 @@ def make_both_tools_node(conn, schema, collection, bm25, chunks, db_path: Option
     We create a fresh, short-lived connection inside the SQL worker thread and
     close it when done. The RAG path (ChromaDB + BM25) is already thread-safe.
     """
-    import sqlite3 as _sqlite3
-
     # Resolve DB path: use explicit arg, else infer from project layout
     _db_path = db_path or (Path(__file__).parent.parent / "db" / "analytics.db")
-    _rag_fn  = make_rag_tool_node(collection, bm25, chunks)
+    _rag_fn  = make_rag_tool_node(collection, bm25, chunks, model=model)
 
     def _run_sql_in_thread(state: AgentState) -> dict:
         """Open a thread-local connection, run SQL, close it."""
-        thread_conn = _sqlite3.connect(str(_db_path))
+        thread_conn = sqlite3.connect(str(_db_path))
         try:
-            sql_fn = make_sql_tool_node(thread_conn, schema)
+            sql_fn = make_sql_tool_node(thread_conn, schema, model=model)
             return sql_fn(state)
         finally:
             thread_conn.close()
@@ -303,7 +341,6 @@ def make_both_tools_node(conn, schema, collection, bm25, chunks, db_path: Option
         return {**sql_update, **rag_update}
 
     return both_tools_node
-
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +422,7 @@ def _format_rag_for_synthesis(rag_result: dict) -> str:
     return f"Policy Knowledge Base (sources: {src_str}):\n\n{answer}"
 
 
-def make_synthesizer_node(model: str = "gemini-3.1-flash-lite"):
+def make_synthesizer_node(model: str = DEFAULT_MODEL) -> Callable[[AgentState], dict]:
     """
     Factory: returns a synthesizer node.
 
@@ -399,10 +436,10 @@ def make_synthesizer_node(model: str = "gemini-3.1-flash-lite"):
     def synthesizer_node(state: AgentState) -> dict:
         route    = state.get("route", "CHITCHAT")
         question = state["question"]
+        client   = _get_client()
 
         # CHITCHAT: conversational reply
         if route == "CHITCHAT":
-            client = genai.Client(api_key=_api_key)
             try:
                 response = client.models.generate_content(
                     model=model,
@@ -448,7 +485,6 @@ def make_synthesizer_node(model: str = "gemini-3.1-flash-lite"):
         )
 
         t0 = time.time()
-        client = genai.Client(api_key=_api_key)
         for attempt in range(3):
             try:
                 response = client.models.generate_content(
@@ -466,9 +502,9 @@ def make_synthesizer_node(model: str = "gemini-3.1-flash-lite"):
                         "synthesizer_ms": round((time.time() - t0) * 1000),
                     },
                 }
-            except Exception as exc:
-                if "429" in str(exc):
-                    if _is_daily_quota_exhausted(str(exc)):
+            except ClientError as exc:
+                if exc.code == 429:
+                    if _is_daily_quota_exhausted(exc):
                         return {
                             "final_answer": "Daily API quota exhausted. Please try again tomorrow.",
                             "error": str(exc),
@@ -482,6 +518,16 @@ def make_synthesizer_node(model: str = "gemini-3.1-flash-lite"):
                             "final_answer": "An error occurred while generating the final answer.",
                             "error": str(exc),
                         }
+                else:
+                    return {
+                        "final_answer": "An error occurred while generating the final answer.",
+                        "error": str(exc),
+                    }
+            except Exception as exc:
+                return {
+                    "final_answer": "An error occurred while generating the final answer.",
+                    "error": str(exc),
+                }
         return {"final_answer": "Failed to generate answer after retries."}
 
     return synthesizer_node
@@ -491,7 +537,10 @@ def make_synthesizer_node(model: str = "gemini-3.1-flash-lite"):
 # Graph Builder
 # ---------------------------------------------------------------------------
 
-def build_agent_graph(conn, schema, collection, bm25, chunks, model: str = "gemini-3.1-flash-lite"):
+def build_agent_graph(
+    conn, schema, collection, bm25, chunks,
+    model: str = DEFAULT_MODEL,
+):
     """
     Build and compile the LangGraph agent state graph.
 
@@ -502,21 +551,33 @@ def build_agent_graph(conn, schema, collection, bm25, chunks, model: str = "gemi
     collection : chromadb.Collection (from rag_pipeline.build_index)
     bm25       : BM25Okapi index (from rag_pipeline.build_index)
     chunks     : list[dict] of RAG chunks
-    model      : Gemini model for planner and synthesizer
+    model      : Gemini model for ALL nodes (planner, tools, synthesizer)
 
     Returns
     -------
     Compiled LangGraph runnable (.invoke(), .stream())
 
-    Design: resources captured once in closures -- no per-call init cost.
+    Design
+    ------
+    Resources are captured once in closures — no per-call init cost.
+    The `model` param flows to every node, ensuring a single point of
+    control for model selection (makes quota-fallback a one-line change).
+
+    Generalisation (Phase 9 "any CSV"): only `conn`, `schema`, and the
+    RAG triple need to change — the graph topology stays the same.
     """
+    # Validate early — fail here rather than deep inside a node
+    _get_client()  # ensures API key is present
+
     graph = StateGraph(AgentState)
 
-    # Register nodes
+    # Register nodes — model param flows through to all factories
     graph.add_node("planner",     planner_node)
-    graph.add_node("sql_tool",    make_sql_tool_node(conn, schema))
-    graph.add_node("rag_tool",    make_rag_tool_node(collection, bm25, chunks))
-    graph.add_node("both_tools",  make_both_tools_node(conn, schema, collection, bm25, chunks))
+    graph.add_node("sql_tool",    make_sql_tool_node(conn, schema, model=model))
+    graph.add_node("rag_tool",    make_rag_tool_node(collection, bm25, chunks, model=model))
+    graph.add_node("both_tools",  make_both_tools_node(
+        conn, schema, collection, bm25, chunks, model=model,
+    ))
     graph.add_node("synthesizer", make_synthesizer_node(model=model))
 
     # Entry point
@@ -599,26 +660,25 @@ def run_agent(question: str, graph) -> dict:
 def load_resources(
     db_path:    Optional[Path] = None,
     docs_dir:   Optional[Path] = None,
-    chroma_dir: str = "chroma_db",
+    chroma_dir: Optional[Path] = None,
 ):
     """
     Load the SQLite DB, schema, and RAG index.
     Designed to be called once before build_agent_graph().
 
+    Generalisation note (Phase 9 "any CSV"): all three resource paths
+    are parameterised.  Callers can point at a user-uploaded DB and a
+    different docs directory without touching any other code.
+
     Returns (conn, schema, collection, bm25, chunks).
     """
-    import sqlite3
-
-    scripts_dir = str(Path(__file__).parent)
-    if scripts_dir not in sys.path:
-        sys.path.insert(0, scripts_dir)
-
     from schema_utils import get_schema
     from rag_pipeline import load_and_chunk_documents, build_index
 
-    root     = Path(__file__).parent.parent
-    db_path  = db_path  or (root / "db"   / "analytics.db")
-    docs_dir = docs_dir or (root / "docs")
+    root       = Path(__file__).parent.parent
+    db_path    = db_path    or (root / "db"   / "analytics.db")
+    docs_dir   = docs_dir   or (root / "docs")
+    chroma_dir = chroma_dir or (root / "chroma_db")
 
     print("Loading database...")
     conn   = sqlite3.connect(str(db_path))
@@ -628,7 +688,7 @@ def load_resources(
 
     print("Loading RAG index...")
     chunks = load_and_chunk_documents(docs_dir)
-    collection, bm25, chunks = build_index(chunks, persist_dir=chroma_dir)
+    collection, bm25, chunks = build_index(chunks, persist_dir=str(chroma_dir))
     print(f"  {len(chunks)} chunks indexed")
 
     return conn, schema, collection, bm25, chunks

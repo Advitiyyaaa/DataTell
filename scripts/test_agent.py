@@ -9,6 +9,10 @@ Runs 23 mixed questions and reports:
   - Timing breakdown by route type
   - Summary table
 
+NOTE: This test suite validates ROUTING accuracy (planner classification),
+not answer correctness. End-to-end answer quality is evaluated separately
+in Phase 7 via RAGAS metrics (faithfulness, relevance, context precision).
+
 Usage (from project root):
     python scripts/test_agent.py              # full suite (slow, hits API)
     python scripts/test_agent.py --fast       # skip BOTH questions (no parallel)
@@ -161,20 +165,10 @@ TEST_QUESTIONS = [
 ]
 
 
+
 # ---------------------------------------------------------------------------
 # Result formatting helpers
 # ---------------------------------------------------------------------------
-
-def _route_emoji(route: str) -> str:
-    return {"SQL": "DB", "RAG": "DOCS", "BOTH": "BOTH", "CHITCHAT": "CHAT"}.get(route, "?")
-
-
-def _result_mark(predicted: str, expected: str) -> str:
-    return "PASS" if predicted == expected else "FAIL"
-
-
-def _print_separator(char: str = "-", width: int = 100) -> None:
-    print(char * width)
 
 
 def _print_question_result(
@@ -185,12 +179,12 @@ def _print_question_result(
     result: dict,
 ) -> None:
     predicted = result["route"]
-    mark = _result_mark(predicted, expected)
+    mark = "PASS" if predicted == expected else "FAIL"
     total_ms = result["total_ms"]
 
     print(f"\n[{idx:02d}] {desc}")
     print(f"  Q        : {question[:90]}{'...' if len(question) > 90 else ''}")
-    print(f"  Expected : {_route_emoji(expected):<6}  |  Predicted : {_route_emoji(predicted):<6}  |  {mark}  |  {total_ms}ms")
+    print(f"  Expected : {expected:<10}|  Predicted : {predicted:<10}|  {mark}  |  {total_ms}ms")
     print(f"  Reason   : {result.get('route_reason', '')}")
 
     if result.get("error"):
@@ -318,7 +312,7 @@ def print_summary(stats: dict) -> None:
 
     # Summary table header
     print(f"\n{'IDX':<5} {'DESC':<35} {'EXPECTED':<10} {'PREDICTED':<10} {'RESULT':<6} {'MS':>6}")
-    _print_separator()
+    print("-" * 100)
 
     by_route: dict = {}
     for r in results:
@@ -332,19 +326,19 @@ def print_summary(stats: dict) -> None:
         mark = "PASS" if r["passed"] else "FAIL"
         print(f"{r['idx']:<5} {r['desc'][:34]:<35} {r['expected']:<10} {r['predicted']:<10} {mark:<6} {r['total_ms']:>6}")
 
-    _print_separator()
+    print("-" * 100)
 
     # Per-route breakdown
     print("\nROUTE ACCURACY BREAKDOWN:")
     print(f"  {'Route':<12} {'Correct':>8} {'Total':>7} {'Accuracy':>9} {'Avg ms':>8}")
-    _print_separator("-", 55)
+    print("-" * 55)
     for route in ["SQL", "RAG", "BOTH", "CHITCHAT"]:
         data = by_route.get(route, {"total": 0, "correct": 0, "ms": []})
         acc  = data["correct"] / data["total"] if data["total"] > 0 else 0.0
         avg_ms = int(sum(data["ms"]) / len(data["ms"])) if data["ms"] else 0
         print(f"  {route:<12} {data['correct']:>8} {data['total']:>7} {acc:>8.1%} {avg_ms:>7}ms")
 
-    _print_separator("-", 55)
+    print("-" * 55)
     print(f"\n  OVERALL ACCURACY: {stats['correct']}/{stats['total']} "
           f"= {stats['accuracy']:.1%}")
 
