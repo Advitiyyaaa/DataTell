@@ -86,9 +86,12 @@ class AgentState(TypedDict):
     route_reason: Optional[str]   # planner one-sentence reasoning
     sql_result:   Optional[dict]  # full dict from nl_to_sql()
     rag_result:   Optional[dict]  # full dict from rag_query()
-    final_answer: Optional[str]
-    error:        Optional[str]
-    metadata:     dict            # timing, model call info, etc.
+    final_answer:   Optional[str]
+    error:          Optional[str]
+    metadata:       dict            # timing, model call info, etc.
+    answer_quality: Optional[str]  # "PASS" | "FAIL"
+    critique:       Optional[str]  # critic's feedback, injected into retry prompt
+    retry_count:    int            # incremented by critic_node; max usable retries = 2
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +113,7 @@ You have access to two information sources:
 
 Classify the user question into exactly one route:
 - SQL     : answerable purely from the transactional database
-- RAG     : answerable purely from the policy documents
+- RAG     : answerable purely from the policy documents (including hypothetical or procedural questions like "What happens if..." or "How do I...")
 - BOTH    : requires BOTH database data AND policy document context
 - CHITCHAT: greeting, meta-question about the system, or completely unanswerable
 
@@ -119,6 +122,7 @@ EXAMPLES:
   "How many orders were delivered late in 2017?"                             -> SQL
   "Which sellers have the highest average review score?"                     -> SQL
   "What is the return window for defective products?"                        -> RAG
+  "What happens to a seller who receives low review scores?"                 -> RAG
   "What are the seller performance guidelines?"                              -> RAG
   "How does the refund process work?"                                        -> RAG
   "What is the average order value for electronics and the return policy?"   -> BOTH
@@ -484,6 +488,14 @@ def make_synthesizer_node(model: str = DEFAULT_MODEL) -> Callable[[AgentState], 
             "Please synthesize a clear, complete answer based only on this evidence."
         )
 
+        retry_count = state.get("retry_count", 0)
+        if retry_count > 0 and state.get("critique"):
+            user_prompt += (
+                f"\n\n---\n\nPREVIOUS ANSWER (REJECTED):\n{state.get('final_answer')}\n\n"
+                f"CRITIQUE: {state.get('critique')}\n\n"
+                "Please rewrite your answer to address the critique above."
+            )
+
         t0 = time.time()
         for attempt in range(3):
             try:
@@ -495,11 +507,15 @@ def make_synthesizer_node(model: str = DEFAULT_MODEL) -> Callable[[AgentState], 
                         temperature=0.1,
                     ),
                 )
+                # Use a per-retry key so cumulative timing survives multiple passes.
+                # retry_count is the count BEFORE this synthesizer call (incremented by critic).
+                run_idx = state.get("retry_count", 0)
+                timing_key = "synthesizer_ms" if run_idx == 0 else f"synthesizer_ms_retry{run_idx}"
                 return {
                     "final_answer": response.text,
                     "metadata": {
                         **state.get("metadata", {}),
-                        "synthesizer_ms": round((time.time() - t0) * 1000),
+                        timing_key: round((time.time() - t0) * 1000),
                     },
                 }
             except ClientError as exc:
@@ -534,6 +550,153 @@ def make_synthesizer_node(model: str = DEFAULT_MODEL) -> Callable[[AgentState], 
 
 
 # ---------------------------------------------------------------------------
+# Critic Node -- Self-Check loop for hallucinations
+# ---------------------------------------------------------------------------
+
+_CRITIC_SYSTEM = """\
+You are an expert evaluator for the DataTell analytics assistant.
+Your job is to evaluate if the assistant's final answer is grounded in the provided evidence and directly answers the user's question.
+
+CRITERIA:
+1. Is the answer directly addressing the user's question?
+2. Is the answer strictly derived from the provided evidence? (No fabrication/hallucination).
+3. If the evidence states no information was found or the query failed, does the answer politely reflect this without making things up?
+
+Respond with ONLY valid JSON (no markdown fences or preamble):
+{"quality": "PASS", "critique": "Looks good."}
+OR
+{"quality": "FAIL", "critique": "<Specific reason why it failed and how to fix it>"}
+"""
+
+def make_critic_node(model: str = DEFAULT_MODEL) -> Callable[[AgentState], dict]:
+    def critic_node(state: AgentState) -> dict:
+        route = state.get("route", "CHITCHAT")
+        # CHITCHAT routes bypass the critic: no factual evidence to check groundedness against.
+        # retry_count is not incremented so the value from run_agent's initial state is preserved.
+        if route == "CHITCHAT":
+            return {
+                "answer_quality": "PASS",
+                "critique": "Bypassed for CHITCHAT — no evidence grounding required.",
+                "retry_count": state.get("retry_count", 0),
+            }
+
+        question = state["question"]
+        final_answer = state.get("final_answer", "")
+        
+        sql_result = state.get("sql_result")
+        rag_result = state.get("rag_result")
+
+        # Build a COMPACT evidence summary for the critic.
+        # Sending the full SQL table (potentially hundreds of rows) wastes tokens;
+        # the critic only needs enough context to verify groundedness.
+        evidence_parts = []
+        if sql_result is not None:
+            if sql_result.get("success") and sql_result.get("results") is not None:
+                df = sql_result["results"].head(5)
+                evidence_parts.append(
+                    f"[SQL — {sql_result.get('row_count', 0)} total rows, showing 5]:\n"
+                    f"{df.to_string(index=False)}"
+                )
+            else:
+                evidence_parts.append(_format_sql_for_synthesis(sql_result))
+        if rag_result is not None:
+            evidence_parts.append(_format_rag_for_synthesis(rag_result))
+
+        if not evidence_parts:
+            evidence = "[No evidence provided]"
+        else:
+            evidence = "\n\n---\n\n".join(evidence_parts)
+             
+        user_prompt = (
+            f"User Question: {question}\n\n"
+            f"Evidence:\n\n{evidence}\n\n"
+            f"Assistant Answer:\n{final_answer}\n\n"
+            "Evaluate the answer based on the criteria."
+        )
+
+        client = _get_client()
+        t0 = time.time()
+        
+        current_retry = state.get("retry_count", 0)
+
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=user_prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=_CRITIC_SYSTEM,
+                        temperature=0.0,
+                    ),
+                )
+                text = response.text.strip()
+                if text.startswith("```"):
+                    inner = text.split("```")
+                    text = inner[1] if len(inner) > 1 else inner[0]
+                    if text.lower().startswith("json"):
+                        text = text[4:].strip()
+                
+                result = json.loads(text.strip())
+                quality = result.get("quality", "FAIL").upper()
+                if quality not in ["PASS", "FAIL"]:
+                    quality = "FAIL"
+                
+                return {
+                    "answer_quality": quality,
+                    "critique": result.get("critique", ""),
+                    "retry_count": current_retry + 1,
+                    "metadata": {
+                        **state.get("metadata", {}),
+                        "critic_ms": state.get("metadata", {}).get("critic_ms", 0) + round((time.time() - t0) * 1000),
+                    }
+                }
+            except json.JSONDecodeError:
+                # Retry silently; if all 3 attempts fail, the post-loop return handles it.
+                pass
+            except ClientError as exc:
+                if exc.code == 429:
+                    if _is_daily_quota_exhausted(exc):
+                        return {"answer_quality": "PASS", "critique": "Quota exhausted during critique, passed to avoid loop", "retry_count": current_retry}
+                    if attempt < 2:
+                        time.sleep(35 * (attempt + 1))
+                    else:
+                        return {"answer_quality": "PASS", "critique": "Rate limit exhausted, passed to avoid loop", "retry_count": current_retry}
+                else:
+                    return {"answer_quality": "PASS", "critique": f"Error: {exc}, passed to avoid loop", "retry_count": current_retry}
+            except Exception as exc:
+                return {"answer_quality": "PASS", "critique": f"Error: {exc}, passed to avoid loop", "retry_count": current_retry}
+
+        # All 3 LLM attempts returned malformed JSON — return FAIL so the
+        # retry loop can attempt a fresh synthesis rather than silently passing.
+        return {
+            "answer_quality": "FAIL",
+            "critique": "Critic could not parse evaluator response after 3 attempts.",
+            "retry_count": current_retry + 1,
+        }
+    
+    return critic_node
+
+
+# ---------------------------------------------------------------------------
+# Critic routing helper -- module-level so it is unit-testable in isolation
+# ---------------------------------------------------------------------------
+
+def route_after_critic(state: AgentState) -> str:
+    """
+    Conditional edge from critic:
+      PASS            -> END
+      FAIL + retries  -> synthesizer (max 2 retries, i.e. retry_count < 2 after first critic run)
+      FAIL + exhausted-> END (pass through best available answer)
+    """
+    if state.get("answer_quality", "PASS") == "PASS":
+        return "END"
+    # retry_count was incremented by critic_node before this edge is evaluated.
+    # After the first critic call: retry_count == 1  -> allow retry (< 2 means one more attempt).
+    # After the second critic call: retry_count == 2 -> exhausted.
+    return "RETRY" if state.get("retry_count", 0) < 2 else "END"
+
+
+# ---------------------------------------------------------------------------
 # Graph Builder
 # ---------------------------------------------------------------------------
 
@@ -551,7 +714,7 @@ def build_agent_graph(
     collection : chromadb.Collection (from rag_pipeline.build_index)
     bm25       : BM25Okapi index (from rag_pipeline.build_index)
     chunks     : list[dict] of RAG chunks
-    model      : Gemini model for ALL nodes (planner, tools, synthesizer)
+    model      : Gemini model for ALL nodes (planner, tools, synthesizer, critic)
 
     Returns
     -------
@@ -562,6 +725,12 @@ def build_agent_graph(
     Resources are captured once in closures — no per-call init cost.
     The `model` param flows to every node, ensuring a single point of
     control for model selection (makes quota-fallback a one-line change).
+
+    Graph topology (Phase 5+):
+        planner --(route)--> sql_tool  --+
+                         --> rag_tool  --+--> synthesizer --> critic --[PASS]--> END
+                         --> both_tools--+                       |
+                         --> synthesizer (CHITCHAT)              +--[FAIL, retries<2]--> synthesizer
 
     Generalisation (Phase 9 "any CSV"): only `conn`, `schema`, and the
     RAG triple need to change — the graph topology stays the same.
@@ -579,6 +748,7 @@ def build_agent_graph(
         conn, schema, collection, bm25, chunks, model=model,
     ))
     graph.add_node("synthesizer", make_synthesizer_node(model=model))
+    graph.add_node("critic",      make_critic_node(model=model))
 
     # Entry point
     graph.set_entry_point("planner")
@@ -600,8 +770,18 @@ def build_agent_graph(
     graph.add_edge("rag_tool",   "synthesizer")
     graph.add_edge("both_tools", "synthesizer")
 
-    # Synthesizer -> END
-    graph.add_edge("synthesizer", END)
+    # Synthesizer -> Critic
+    graph.add_edge("synthesizer", "critic")
+
+    # Critic -> conditional edge (route_after_critic is module-level for testability)
+    graph.add_conditional_edges(
+        "critic",
+        route_after_critic,
+        {
+            "END": END,
+            "RETRY": "synthesizer",
+        }
+    )
 
     return graph.compile()
 
@@ -617,15 +797,18 @@ def run_agent(question: str, graph) -> dict:
     Returns
     -------
     {
-        "question":     str,
-        "route":        str,           # SQL | RAG | BOTH | CHITCHAT
-        "route_reason": str,
-        "final_answer": str,
-        "sql_result":   dict | None,
-        "rag_result":   dict | None,
-        "error":        str | None,
-        "metadata":     dict,
-        "total_ms":     int,
+        "question":      str,
+        "route":         str,           # SQL | RAG | BOTH | CHITCHAT
+        "route_reason":  str,
+        "final_answer":  str,
+        "sql_result":    dict | None,
+        "rag_result":    dict | None,
+        "error":         str | None,
+        "metadata":      dict,          # timing per node (synthesizer_ms, critic_ms, ...)
+        "total_ms":      int,
+        "answer_quality": str | None,  # "PASS" | "FAIL" from critic
+        "critique":      str | None,   # critic's feedback (present when FAIL or CHITCHAT bypass)
+        "retry_count":   int,          # number of critic evaluations performed (0 for CHITCHAT)
     }
     """
     t0 = time.time()
@@ -638,6 +821,9 @@ def run_agent(question: str, graph) -> dict:
         "final_answer": None,
         "error":        None,
         "metadata":     {},
+        "answer_quality": None,
+        "critique":     None,
+        "retry_count":  0,
     }
     final_state = graph.invoke(initial_state)
     return {
@@ -650,6 +836,9 @@ def run_agent(question: str, graph) -> dict:
         "error":        final_state.get("error"),
         "metadata":     final_state.get("metadata", {}),
         "total_ms":     round((time.time() - t0) * 1000),
+        "answer_quality": final_state.get("answer_quality"),
+        "critique":     final_state.get("critique"),
+        "retry_count":  final_state.get("retry_count", 0),
     }
 
 
@@ -732,6 +921,11 @@ if __name__ == "__main__":
         status = "OK" if r.get("answerable") else "FAIL"
         print(f"  RAG      : [{status}] answerable={r.get('answerable')} | "
               f"sources={r.get('sources', [])} ({r.get('tool_ms', 0)}ms)")
+
+    if result.get("answer_quality"):
+        print(f"  Critic   : [{result['answer_quality']}] retries={result['retry_count']}")
+        if result.get("critique") and result["answer_quality"] != "PASS":
+            print(f"  Critique : {result['critique']}")
 
     print(f"\n{'-'*70}")
     print("Answer:\n")
