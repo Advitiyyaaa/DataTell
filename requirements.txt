@@ -30,7 +30,9 @@ tabulate>=0.9.0
 ragas>=0.1.0
 
 # UI (Phase 6)
-streamlit>=1.36.0
+fastapi>=0.100.0
+uvicorn>=0.23.0
+pydantic>=2.0.0
 plotly>=5.22.0
 
 # Dev / notebooks

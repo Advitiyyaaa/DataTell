@@ -59,6 +59,7 @@ CRITICAL RULES — follow every one:
 6. Always use table aliases (e.g. FROM orders o JOIN customers c ON ...).
 7. For revenue calculations use order_items.price (not payments.payment_value — payments can be split across installments).
 8. The `reviews` table has review_comment_message (free text) and review_score (integer 1-5).
+9. For subjective terms like "best" or "worst" products/categories, compute aggregates (e.g., AVG(review_score) or COUNT(order_id)) and group by product_category_name_english. Rank aggregates properly using ORDER BY and LIMIT. Filter with HAVING COUNT(...) >= 30 to ensure statistical significance. DO NOT select a random row with score 1 or 5.
 
 TABLE RELATIONSHIPS (foreign keys — not enforced in SQLite but must be respected):
   orders.customer_id        → customers.customer_id

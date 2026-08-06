@@ -235,9 +235,14 @@ def make_sql_tool_node(
     """
     def sql_tool_node(state: AgentState) -> dict:
         t0 = time.time()
+        
+        question = state["question"]
+        if state.get("retry_count", 0) > 0 and state.get("critique"):
+            question += f"\n\nCRITIQUE OF PREVIOUS ATTEMPT:\n{state['critique']}\n\nPlease address this critique."
+
         try:
             result = nl_to_sql(
-                state["question"],
+                question,
                 schema,
                 conn,
                 model=model,
@@ -278,9 +283,14 @@ def make_rag_tool_node(
     """
     def rag_tool_node(state: AgentState) -> dict:
         t0 = time.time()
+        
+        question = state["question"]
+        if state.get("retry_count", 0) > 0 and state.get("critique"):
+            question += f"\n\nCRITIQUE OF PREVIOUS ATTEMPT:\n{state['critique']}\n\nPlease address this critique."
+
         try:
             result = rag_query(
-                state["question"],
+                question,
                 collection,
                 bm25,
                 chunks,
@@ -555,17 +565,17 @@ def make_synthesizer_node(model: str = DEFAULT_MODEL) -> Callable[[AgentState], 
 
 _CRITIC_SYSTEM = """\
 You are an expert evaluator for the DataTell analytics assistant.
-Your job is to evaluate if the assistant's final answer is grounded in the provided evidence and directly answers the user's question.
+Your job is to evaluate if the generated evidence (SQL data or RAG text) is SUFFICIENT to fully answer the user's question, AND if the assistant's final answer is grounded in that evidence.
 
 CRITERIA:
-1. Is the answer directly addressing the user's question?
-2. Is the answer strictly derived from the provided evidence? (No fabrication/hallucination).
-3. If the evidence states no information was found or the query failed, does the answer politely reflect this without making things up?
+1. EVIDENCE COMPLETENESS: Does the provided evidence fully cover ALL parts of the user's question? If the user asks for multiple things (e.g., "best and worst"), and the evidence only contains one (e.g., only "best"), you MUST FAIL it.
+2. DIRECTNESS: Is the final answer directly addressing the user's question?
+3. GROUNDEDNESS: Is the answer strictly derived from the provided evidence? (No fabrication/hallucination).
 
 Respond with ONLY valid JSON (no markdown fences or preamble):
-{"quality": "PASS", "critique": "Looks good."}
+{"quality": "PASS", "critique": "Looks good. Evidence fully covers the request."}
 OR
-{"quality": "FAIL", "critique": "<Specific reason why it failed and how to fix it>"}
+{"quality": "FAIL", "critique": "<Specific reason why it failed. E.g., 'The SQL evidence only contains best reviews, but the user also asked for worst.'>"}
 """
 
 def make_critic_node(model: str = DEFAULT_MODEL) -> Callable[[AgentState], dict]:
@@ -685,15 +695,23 @@ def route_after_critic(state: AgentState) -> str:
     """
     Conditional edge from critic:
       PASS            -> END
-      FAIL + retries  -> synthesizer (max 2 retries, i.e. retry_count < 2 after first critic run)
+      FAIL + retries  -> route back to the tool node (max 2 retries)
       FAIL + exhausted-> END (pass through best available answer)
     """
     if state.get("answer_quality", "PASS") == "PASS":
         return "END"
-    # retry_count was incremented by critic_node before this edge is evaluated.
-    # After the first critic call: retry_count == 1  -> allow retry (< 2 means one more attempt).
-    # After the second critic call: retry_count == 2 -> exhausted.
-    return "RETRY" if state.get("retry_count", 0) < 2 else "END"
+    
+    if state.get("retry_count", 0) < 2:
+        route = state.get("route", "CHITCHAT")
+        if route == "SQL":
+            return "sql_tool"
+        elif route == "RAG":
+            return "rag_tool"
+        elif route == "BOTH":
+            return "both_tools"
+        return "synthesizer" # fallback
+        
+    return "END"
 
 
 # ---------------------------------------------------------------------------
@@ -779,7 +797,10 @@ def build_agent_graph(
         route_after_critic,
         {
             "END": END,
-            "RETRY": "synthesizer",
+            "sql_tool": "sql_tool",
+            "rag_tool": "rag_tool",
+            "both_tools": "both_tools",
+            "synthesizer": "synthesizer",
         }
     )
 
