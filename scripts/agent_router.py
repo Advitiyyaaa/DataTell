@@ -82,6 +82,7 @@ DEFAULT_MODEL = "gemini-3.1-flash-lite"
 class AgentState(TypedDict):
     """Mutable state passed between LangGraph nodes."""
     question:     str
+    history:      Optional[list]  # [{"role": "user"|"assistant", "content": str}, ...]
     route:        Optional[str]   # "SQL" | "RAG" | "BOTH" | "CHITCHAT"
     route_reason: Optional[str]   # planner one-sentence reasoning
     sql_result:   Optional[dict]  # full dict from nl_to_sql()
@@ -451,13 +452,25 @@ def make_synthesizer_node(model: str = DEFAULT_MODEL) -> Callable[[AgentState], 
         route    = state.get("route", "CHITCHAT")
         question = state["question"]
         client   = _get_client()
+        history  = state.get("history") or []
+
+        # Build a conversation-history prefix for multi-turn context
+        def _history_block(history: list) -> str:
+            if not history:
+                return ""
+            lines = []
+            for turn in history[-6:]:  # cap at last 6 turns to stay within token budget
+                role = "User" if turn.get("role") == "user" else "DataTell"
+                lines.append(f"{role}: {turn.get('content', '').strip()}")
+            return "Conversation so far:\n" + "\n".join(lines) + "\n\n"
 
         # CHITCHAT: conversational reply
         if route == "CHITCHAT":
             try:
+                chitchat_prompt = _history_block(history) + question
                 response = client.models.generate_content(
                     model=model,
-                    contents=question,
+                    contents=chitchat_prompt,
                     config=types.GenerateContentConfig(
                         system_instruction=_CHITCHAT_SYSTEM,
                         temperature=0.5,
@@ -492,7 +505,9 @@ def make_synthesizer_node(model: str = DEFAULT_MODEL) -> Callable[[AgentState], 
             }
 
         evidence = "\n\n---\n\n".join(evidence_parts)
+        history_prefix = _history_block(history)
         user_prompt = (
+            f"{history_prefix}"
             f"User Question: {question}\n\n"
             f"Evidence:\n\n{evidence}\n\n"
             "Please synthesize a clear, complete answer based only on this evidence."
@@ -651,7 +666,7 @@ def make_critic_node(model: str = DEFAULT_MODEL) -> Callable[[AgentState], dict]
                 if quality not in ["PASS", "FAIL"]:
                     quality = "FAIL"
                 
-                return {
+                output = {
                     "answer_quality": quality,
                     "critique": result.get("critique", ""),
                     "retry_count": current_retry + 1,
@@ -660,6 +675,16 @@ def make_critic_node(model: str = DEFAULT_MODEL) -> Callable[[AgentState], dict]
                         "critic_ms": state.get("metadata", {}).get("critic_ms", 0) + round((time.time() - t0) * 1000),
                     }
                 }
+                
+                # If retries are exhausted and still failing, overwrite the hallucinated answer
+                if quality == "FAIL" and current_retry >= 2:
+                    output["final_answer"] = (
+                        "I apologize, but after multiple attempts, I could not synthesize a completely accurate and grounded answer based on the available data.\n\n"
+                        f"**Self-Evaluation Issue:** {result.get('critique', '')}\n\n"
+                        "Please try rephrasing your question or narrowing your request."
+                    )
+                    
+                return output
             except json.JSONDecodeError:
                 # Retry silently; if all 3 attempts fail, the post-loop return handles it.
                 pass
@@ -678,11 +703,17 @@ def make_critic_node(model: str = DEFAULT_MODEL) -> Callable[[AgentState], dict]
 
         # All 3 LLM attempts returned malformed JSON — return FAIL so the
         # retry loop can attempt a fresh synthesis rather than silently passing.
-        return {
+        output = {
             "answer_quality": "FAIL",
             "critique": "Critic could not parse evaluator response after 3 attempts.",
             "retry_count": current_retry + 1,
         }
+        if current_retry >= 2:
+            output["final_answer"] = (
+                "I apologize, but I encountered an internal error during self-evaluation. "
+                "I cannot guarantee the accuracy of the current response, so it has been withheld."
+            )
+        return output
     
     return critic_node
 
@@ -701,7 +732,7 @@ def route_after_critic(state: AgentState) -> str:
     if state.get("answer_quality", "PASS") == "PASS":
         return "END"
     
-    if state.get("retry_count", 0) < 2:
+    if state.get("retry_count", 0) < 3:
         route = state.get("route", "CHITCHAT")
         if route == "SQL":
             return "sql_tool"
@@ -811,9 +842,17 @@ def build_agent_graph(
 # Public API
 # ---------------------------------------------------------------------------
 
-def run_agent(question: str, graph) -> dict:
+def run_agent(question: str, graph, history: Optional[list] = None) -> dict:
     """
     Run the agent on a single question.
+
+    Parameters
+    ----------
+    question : str
+    graph    : compiled LangGraph
+    history  : optional list of {"role": str, "content": str} dicts representing
+               prior conversation turns (most recent last). Capped to last 6 turns
+               inside the synthesizer to stay within token budget.
 
     Returns
     -------
@@ -835,6 +874,7 @@ def run_agent(question: str, graph) -> dict:
     t0 = time.time()
     initial_state: AgentState = {
         "question":     question,
+        "history":      history or [],
         "route":        None,
         "route_reason": None,
         "sql_result":   None,

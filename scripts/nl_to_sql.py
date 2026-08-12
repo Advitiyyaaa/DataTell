@@ -59,7 +59,9 @@ CRITICAL RULES — follow every one:
 6. Always use table aliases (e.g. FROM orders o JOIN customers c ON ...).
 7. For revenue calculations use order_items.price (not payments.payment_value — payments can be split across installments).
 8. The `reviews` table has review_comment_message (free text) and review_score (integer 1-5).
-9. For subjective terms like "best" or "worst" products/categories, compute aggregates (e.g., AVG(review_score) or COUNT(order_id)) and group by product_category_name_english. Rank aggregates properly using ORDER BY and LIMIT. Filter with HAVING COUNT(...) >= 30 to ensure statistical significance. DO NOT select a random row with score 1 or 5.
+9. For ANY question about products or categories (top/best/worst/most/least/all/any), ALWAYS group by and SELECT p.product_category_name_english (not product_id). Join order_items with products ON oi.product_id = p.product_id. Rank by aggregate (COUNT, SUM, AVG) and apply LIMIT. Add HAVING COUNT(*) >= 10 when computing averages to ensure statistical significance. NEVER return raw product_id UUIDs as the primary display column.
+10. product_id is a UUID and MUST NEVER appear as the sole identifying column in results shown to users. If a query involves the products table, you MUST SELECT p.product_category_name_english as the human-readable label.
+11. STRICTLY FORBIDDEN: SELECT product_id FROM ... without also selecting p.product_category_name_english. Every product result MUST include the category name.
 
 TABLE RELATIONSHIPS (foreign keys — not enforced in SQLite but must be respected):
   orders.customer_id        → customers.customer_id
