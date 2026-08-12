@@ -238,8 +238,24 @@ def make_sql_tool_node(
         t0 = time.time()
         
         question = state["question"]
+
+        # On retry: inject the critic's feedback so nl_to_sql writes a better query.
         if state.get("retry_count", 0) > 0 and state.get("critique"):
-            question += f"\n\nCRITIQUE OF PREVIOUS ATTEMPT:\n{state['critique']}\n\nPlease address this critique."
+            question += (
+                f"\n\nCRITIQUE OF PREVIOUS ATTEMPT:\n{state['critique']}\n\n"
+                "Please rewrite your SQL to address ALL parts of the question above."
+            )
+        else:
+            # On FIRST attempt: add a completeness hint to pre-empt the most common
+            # Critic failure — the LLM writing a query that only covers one item
+            # when the user asked for N. Rule 12 in the system prompt gives the CTE
+            # pattern; this hint reminds the LLM to apply it.
+            question += (
+                "\n\n[IMPORTANT: If this question asks for details about the 'top N' items "
+                "(e.g. reviews/prices for top 5 categories), use a CTE to first find all N items, "
+                "then JOIN the detail table against that CTE so ALL N items are covered — "
+                "never filter to just one hardcoded value.]"
+            )
 
         try:
             result = nl_to_sql(
@@ -376,6 +392,13 @@ Formatting rules:
    section from the policy section, then add a brief "Summary" paragraph tying both.
 5. Never fabricate information not present in the evidence.
 6. Keep responses concise but complete.
+
+COMPLETENESS CHECK (do this BEFORE writing your response):
+- Re-read the user's question and identify EVERY sub-part (e.g. if they asked for
+  both "best" and "worst", you must address BOTH).
+- If the evidence only covers SOME parts of the question, clearly state which parts
+  are covered and which are missing — do NOT silently omit or hallucinate missing data.
+- Never present a partial answer as if it were complete.
 """
 
 _CHITCHAT_SYSTEM = """\
@@ -584,8 +607,18 @@ Your job is to evaluate if the generated evidence (SQL data or RAG text) is SUFF
 
 CRITERIA:
 1. EVIDENCE COMPLETENESS: Does the provided evidence fully cover ALL parts of the user's question? If the user asks for multiple things (e.g., "best and worst"), and the evidence only contains one (e.g., only "best"), you MUST FAIL it.
+   IMPORTANT: The evidence shown to you is a SAMPLE of the full SQL result. The header tells you the TOTAL row count and which unique categories/groups are present. If the header says N total rows and lists multiple distinct categories, the evidence IS complete even if only a few rows per category are shown.
 2. DIRECTNESS: Is the final answer directly addressing the user's question?
 3. GROUNDEDNESS: Is the answer strictly derived from the provided evidence? (No fabrication/hallucination).
+   ALLOWED TRANSFORMATIONS (these are NOT hallucination):
+   - Translating text from Portuguese (or any language) to English when the user asked for English
+   - Reformatting numbers, dates, or currency into readable form
+   - Summarising or paraphrasing long text present in the evidence
+   - Computing simple derived values (e.g. percentage from count/total both in evidence)
+   REAL HALLUCINATION examples (these ARE fabrication):
+   - Citing a category name that does not appear in the SQL result at all
+   - Inventing a review score or review text not present in the evidence
+   - Adding extra rows beyond what the SQL returned
 
 Respond with ONLY valid JSON (no markdown fences or preamble):
 {"quality": "PASS", "critique": "Looks good. Evidence fully covers the request."}
@@ -617,10 +650,30 @@ def make_critic_node(model: str = DEFAULT_MODEL) -> Callable[[AgentState], dict]
         evidence_parts = []
         if sql_result is not None:
             if sql_result.get("success") and sql_result.get("results") is not None:
-                df = sql_result["results"].head(5)
+                df_full = sql_result["results"]
+                row_count = sql_result.get("row_count", len(df_full))
+
+                # Stratified sample: show up to 2 rows per unique value of the first
+                # column so the critic can see ALL groups are present (e.g. all 5
+                # categories), not just the first 5 rows which may all be one group.
+                first_col = df_full.columns[0] if len(df_full.columns) > 0 else None
+                if first_col is not None and df_full[first_col].nunique() > 1:
+                    df_sample = (
+                        df_full.groupby(first_col, sort=False)
+                        .head(2)
+                        .head(20)  # cap total at 20 rows
+                    )
+                    unique_vals = df_full[first_col].unique().tolist()
+                    unique_summary = f"Distinct '{first_col}' values ({len(unique_vals)}): {unique_vals}"
+                else:
+                    df_sample = df_full.head(10)
+                    unique_summary = ""
+
+                sample_str = df_sample.to_string(index=False)
                 evidence_parts.append(
-                    f"[SQL — {sql_result.get('row_count', 0)} total rows, showing 5]:\n"
-                    f"{df.to_string(index=False)}"
+                    f"[SQL — {row_count} total rows, stratified sample shown]\n"
+                    + (f"{unique_summary}\n" if unique_summary else "")
+                    + sample_str
                 )
             else:
                 evidence_parts.append(_format_sql_for_synthesis(sql_result))

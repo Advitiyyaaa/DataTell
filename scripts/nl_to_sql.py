@@ -62,6 +62,22 @@ CRITICAL RULES — follow every one:
 9. For ANY question about products or categories (top/best/worst/most/least/all/any), ALWAYS group by and SELECT p.product_category_name_english (not product_id). Join order_items with products ON oi.product_id = p.product_id. Rank by aggregate (COUNT, SUM, AVG) and apply LIMIT. Add HAVING COUNT(*) >= 10 when computing averages to ensure statistical significance. NEVER return raw product_id UUIDs as the primary display column.
 10. product_id is a UUID and MUST NEVER appear as the sole identifying column in results shown to users. If a query involves the products table, you MUST SELECT p.product_category_name_english as the human-readable label.
 11. STRICTLY FORBIDDEN: SELECT product_id FROM ... without also selecting p.product_category_name_english. Every product result MUST include the category name.
+12. MULTI-STEP / RANKING-THEN-LOOKUP QUERIES: When the question asks for details (e.g. reviews, prices, seller info) about the "top N" or "best/worst N" items in a category, you MUST use a CTE to first compute the ranked set, then JOIN or filter the details table against that CTE.
+    CORRECT PATTERN (e.g. "top reviews for top 5 most sold categories"):
+      WITH top_cats AS (
+        SELECT p.product_category_name_english AS category, COUNT(*) AS total_orders
+        FROM order_items oi JOIN products p ON oi.product_id = p.product_id
+        GROUP BY category ORDER BY total_orders DESC LIMIT 5
+      )
+      SELECT tc.category, r.review_score, r.review_comment_message
+      FROM top_cats tc
+      JOIN order_items oi ON ...
+      JOIN orders o ON oi.order_id = o.order_id
+      JOIN reviews r ON o.order_id = r.order_id
+      WHERE r.review_comment_message IS NOT NULL AND r.review_comment_message != ''
+      ORDER BY tc.total_orders DESC, r.review_score DESC;
+    WRONG PATTERN: querying only one category hardcoded, or writing separate UNION queries per category.
+    WRONG PATTERN: any query that returns rows for only one category when the user asked for N categories.
 
 TABLE RELATIONSHIPS (foreign keys — not enforced in SQLite but must be respected):
   orders.customer_id        → customers.customer_id
