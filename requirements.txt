@@ -5,33 +5,23 @@ numpy>=1.26.0
 # Environment variables
 python-dotenv>=1.0.0
 
-# Database
-# sqlite3 is part of Python stdlib — no install needed
-
-# LLM & embeddings (Phase 2 & 3)
-openai>=1.30.0
+# LLM API (Phase 2 & 3)
 google-genai>=1.0.0
-sentence-transformers>=3.0.0
 
-# Vector store (Phase 3)
+# Vector store (Phase 3) - includes lightweight ONNX runtime
 chromadb>=0.5.0
 
 # BM25 hybrid search (Phase 3)
 rank-bm25>=0.2.2
 
-# Agent framework (Phase 4)
+# Agent framework (Phase 4 & 5)
 langgraph>=0.2.0
 langchain-core>=0.2.0
 
 # Table formatting for synthesizer
 tabulate>=0.9.0
 
-# Evaluation (Phase 7)
-ragas>=0.1.0
-langchain-google-genai>=1.0.0
-datasets>=2.19.0
-
-# UI (Phase 6)
+# Web API & UI Backend (Phase 6)
 fastapi>=0.100.0
 uvicorn>=0.23.0
 pydantic>=2.0.0
@@ -39,7 +29,3 @@ plotly>=5.22.0
 
 # Cloud deploy (Phase 8)
 requests>=2.31.0         # Turso Cloud HTTP API client (via turso_client.py)
-
-# Dev / notebooks
-jupyterlab>=4.0.0
-ipykernel>=6.0.0

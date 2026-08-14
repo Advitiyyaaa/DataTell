@@ -283,17 +283,14 @@ def build_index(
       chunks     : the input chunks list (needed to map BM25 results back to text)
     """
     import chromadb
-    from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
-    # Limit torch to 1 thread to avoid 100% CPU lockup on cloud free-tier containers (Render)
+    # Use ONNX embedding function for lightweight footprint (< 50MB RAM vs 450MB with PyTorch)
     try:
-        import torch
-        torch.set_num_threads(1)
+        from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
+        ef = ONNXMiniLM_L6_V2()
     except Exception:
-        pass
-
-    # Embedding function — sentence-transformers runs locally, no API calls
-    ef = SentenceTransformerEmbeddingFunction(model_name=embedding_model)
+        from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+        ef = SentenceTransformerEmbeddingFunction(model_name=embedding_model)
 
     if chroma_mode == "cloud":
         # ── Chroma Cloud mode ──────────────────────────────────────────────────
