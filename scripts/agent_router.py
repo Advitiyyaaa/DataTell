@@ -964,6 +964,8 @@ def load_resources(
     db_path:    Optional[Path] = None,
     docs_dir:   Optional[Path] = None,
     chroma_dir: Optional[Path] = None,
+    use_turso:  Optional[bool] = None,
+    chroma_mode: Optional[str] = None,
 ):
     """
     Load the SQLite DB, schema, and RAG index.
@@ -972,6 +974,12 @@ def load_resources(
     Generalisation note (Phase 9 "any CSV"): all three resource paths
     are parameterised.  Callers can point at a user-uploaded DB and a
     different docs directory without touching any other code.
+
+    Cloud mode (Phase 8):
+    - use_turso=True  → connects to Turso Cloud via pyturso (drop-in sqlite3 replacement)
+    - chroma_mode="cloud" → connects to Chroma Cloud via chromadb.CloudClient
+    Both default to the USE_TURSO / CHROMA_MODE environment variables so the
+    caller (api.py) doesn't need to hard-code anything.
 
     Returns (conn, schema, collection, bm25, chunks).
     """
@@ -983,15 +991,45 @@ def load_resources(
     docs_dir   = docs_dir   or (root / "docs")
     chroma_dir = chroma_dir or (root / "chroma_db")
 
+    # Read cloud flags from env if not explicitly passed
+    if use_turso is None:
+        use_turso = os.getenv("USE_TURSO", "false").lower() == "true"
+    if chroma_mode is None:
+        chroma_mode = os.getenv("CHROMA_MODE", "local")
+
     print("Loading database...")
-    conn   = sqlite3.connect(str(db_path))
+    if use_turso:
+        # ── Turso Cloud (pyturso is a drop-in sqlite3 replacement) ────────────
+        try:
+            import turso  # pyturso
+        except ImportError:
+            raise ImportError(
+                "pyturso is required for Turso Cloud mode. Run: pip install pyturso"
+            )
+        turso_url   = os.getenv("TURSO_DATABASE_URL")
+        turso_token = os.getenv("TURSO_AUTH_TOKEN")
+        if not turso_url or not turso_token:
+            raise EnvironmentError(
+                "TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must be set in .env "
+                "when USE_TURSO=true."
+            )
+        conn = turso.connect(remote_url=turso_url, auth_token=turso_token)
+        print(f"  Connected to Turso Cloud: {turso_url}")
+    else:
+        # ── Local SQLite (default) ─────────────────────────────────────────────
+        conn = sqlite3.connect(str(db_path))
+
     schema = get_schema(conn)
     total_rows = sum(v["row_count"] for v in schema.values())
     print(f"  {len(schema)} tables | {total_rows:,} total rows")
 
     print("Loading RAG index...")
     chunks = load_and_chunk_documents(docs_dir)
-    collection, bm25, chunks = build_index(chunks, persist_dir=str(chroma_dir))
+    collection, bm25, chunks = build_index(
+        chunks,
+        persist_dir=str(chroma_dir),
+        chroma_mode=chroma_mode,
+    )
     print(f"  {len(chunks)} chunks indexed")
 
     return conn, schema, collection, bm25, chunks

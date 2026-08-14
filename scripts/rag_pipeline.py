@@ -261,6 +261,7 @@ def build_index(
     embedding_model: str = "all-MiniLM-L6-v2",
     collection_name: str = "datatell_docs",
     rebuild: bool = False,
+    chroma_mode: str = "local",
 ) -> tuple:
     """
     Build (or load) the dual index: ChromaDB vector store + BM25 keyword index.
@@ -284,44 +285,69 @@ def build_index(
     import chromadb
     from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
-    persist_path = Path(__file__).parent.parent / persist_dir
-    persist_path.mkdir(exist_ok=True)
-
     # Embedding function — sentence-transformers runs locally, no API calls
     ef = SentenceTransformerEmbeddingFunction(model_name=embedding_model)
 
-    client = chromadb.PersistentClient(path=str(persist_path))
+    if chroma_mode == "cloud":
+        # ── Chroma Cloud mode ──────────────────────────────────────────────────
+        # Collection is pre-populated by scripts/migrate_to_chroma_cloud.py.
+        # We only need to read from it at query time, so skip the rebuild logic.
+        tenant   = os.getenv("CHROMA_TENANT")
+        database = os.getenv("CHROMA_DATABASE", "datatell")
+        api_key  = os.getenv("CHROMA_API_KEY")
+        if not all([tenant, database, api_key]):
+            raise EnvironmentError(
+                "CHROMA_TENANT, CHROMA_DATABASE, and CHROMA_API_KEY must be set "
+                "in .env when CHROMA_MODE=cloud."
+            )
+        client = chromadb.CloudClient(
+            tenant=tenant,
+            database=database,
+            api_key=api_key,
+        )
+        collection = client.get_or_create_collection(
+            name=collection_name,
+            embedding_function=ef,
+            metadata={"hnsw:space": "cosine"},
+        )
+        print(f"  Connected to Chroma Cloud collection '{collection_name}': {collection.count()} docs")
+    else:
+        # ── Local PersistentClient mode (default) ──────────────────────────────
+        persist_path = Path(__file__).parent.parent / persist_dir
+        persist_path.mkdir(exist_ok=True)
 
-    collection = client.get_or_create_collection(
-        name=collection_name,
-        embedding_function=ef,
-        metadata={"hnsw:space": "cosine"},
-    )
+        client = chromadb.PersistentClient(path=str(persist_path))
 
-    manifest_path = persist_path / f"{collection_name}.manifest.json"
-    expected_manifest = _index_manifest(chunks, embedding_model)
-    manifest_matches = _read_manifest(manifest_path) == expected_manifest
-    needs_rebuild = rebuild or collection.count() != len(chunks) or not manifest_matches
-
-    if needs_rebuild and collection.count() > 0:
-        client.delete_collection(collection_name)
-        print(f"  Rebuilding collection '{collection_name}' because its index manifest changed")
-        collection = client.create_collection(
+        collection = client.get_or_create_collection(
             name=collection_name,
             embedding_function=ef,
             metadata={"hnsw:space": "cosine"},
         )
 
-    # Only add documents if collection is empty or its manifest changed.
-    if collection.count() == 0:
-        print(f"  Embedding {len(chunks)} chunks with '{embedding_model}'...")
-        _add_in_batches(collection, chunks)
-        manifest_path.write_text(
-            json.dumps(expected_manifest, indent=2, sort_keys=True), encoding="utf-8"
-        )
-        print(f"  ChromaDB collection '{collection_name}': {collection.count()} documents")
-    else:
-        print(f"  Loaded existing ChromaDB collection '{collection_name}': {collection.count()} docs")
+        manifest_path = persist_path / f"{collection_name}.manifest.json"
+        expected_manifest = _index_manifest(chunks, embedding_model)
+        manifest_matches = _read_manifest(manifest_path) == expected_manifest
+        needs_rebuild = rebuild or collection.count() != len(chunks) or not manifest_matches
+
+        if needs_rebuild and collection.count() > 0:
+            client.delete_collection(collection_name)
+            print(f"  Rebuilding collection '{collection_name}' because its index manifest changed")
+            collection = client.create_collection(
+                name=collection_name,
+                embedding_function=ef,
+                metadata={"hnsw:space": "cosine"},
+            )
+
+        # Only add documents if collection is empty or its manifest changed.
+        if collection.count() == 0:
+            print(f"  Embedding {len(chunks)} chunks with '{embedding_model}'...")
+            _add_in_batches(collection, chunks)
+            manifest_path.write_text(
+                json.dumps(expected_manifest, indent=2, sort_keys=True), encoding="utf-8"
+            )
+            print(f"  ChromaDB collection '{collection_name}': {collection.count()} documents")
+        else:
+            print(f"  Loaded existing ChromaDB collection '{collection_name}': {collection.count()} docs")
 
     # Build BM25 index (in-memory, fast, always rebuilt)
     tokenized_corpus = [_tokenize_for_bm25(c["text"]) for c in chunks]

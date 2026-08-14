@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -50,14 +51,30 @@ _db_path = root_dir / "db" / "analytics.db"
 def startup_event():
     global agent_graph
     print("Initializing DataTell Agent...")
-    try:
-        conn, schema, collection, bm25, chunks = load_resources()
 
-        # FastAPI runs sync endpoints in worker threads, but conn was created in the startup thread.
-        # This causes SQLite "objects created in a thread can only be used in that same thread" errors.
-        # Since our queries are read-only, we can recreate the connection with check_same_thread=False.
-        conn.close()
-        thread_safe_conn = sqlite3.connect(str(_db_path), check_same_thread=False)
+    # Cloud mode flags — read from environment variables
+    # Set USE_TURSO=true and CHROMA_MODE=cloud in Render env vars for production.
+    use_turso   = os.getenv("USE_TURSO", "false").lower() == "true"
+    chroma_mode = os.getenv("CHROMA_MODE", "local")
+
+    print(f"  DB mode    : {'Turso Cloud' if use_turso else 'Local SQLite'}")
+    print(f"  Chroma mode: {chroma_mode}")
+
+    try:
+        conn, schema, collection, bm25, chunks = load_resources(
+            use_turso=use_turso,
+            chroma_mode=chroma_mode,
+        )
+
+        if not use_turso:
+            # FastAPI runs sync endpoints in worker threads, but conn was created in the startup thread.
+            # This causes SQLite "objects created in a thread can only be used in that same thread" errors.
+            # Since our queries are read-only, we can recreate the connection with check_same_thread=False.
+            # (pyturso handles thread-safety internally, so this is only needed for local SQLite.)
+            conn.close()
+            thread_safe_conn = sqlite3.connect(str(_db_path), check_same_thread=False)
+        else:
+            thread_safe_conn = conn  # pyturso is thread-safe
 
         agent_graph = build_agent_graph(thread_safe_conn, schema, collection, bm25, chunks)
         print("Agent ready.")
@@ -178,4 +195,6 @@ async def query_stream(req: QueryRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
+    # Render sets the PORT env var; default to 8000 for local development
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("api:app", host="0.0.0.0", port=port, reload=(port == 8000))

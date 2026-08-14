@@ -2,7 +2,9 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Send, AlertCircle } from 'lucide-react';
 import ResultRenderer from './ResultRenderer';
 
-const API_BASE = 'http://localhost:8000';
+// In production (Vercel), set VITE_API_URL to your Render backend URL.
+// Locally, it falls back to localhost:8000.
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 function ChatInterface({ onTraceUpdate }) {
   const [messages, setMessages] = useState([]);

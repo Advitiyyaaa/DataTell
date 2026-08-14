@@ -37,6 +37,9 @@ uvicorn>=0.23.0
 pydantic>=2.0.0
 plotly>=5.22.0
 
+# Cloud deploy (Phase 8)
+pyturso>=0.1.0          # Turso Cloud: drop-in sqlite3 replacement
+
 # Dev / notebooks
 jupyterlab>=4.0.0
 ipykernel>=6.0.0

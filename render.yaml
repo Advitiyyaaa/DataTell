@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: datatell-api
+    runtime: python
+    rootDir: .
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn backend.api:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false        # set manually in Render dashboard
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
+      - key: CHROMA_TENANT
+        sync: false
+      - key: CHROMA_DATABASE
+        value: datatell
+      - key: CHROMA_API_KEY
+        sync: false
+      - key: CHROMA_MODE
+        value: cloud
+      - key: USE_TURSO
+        value: "true"
