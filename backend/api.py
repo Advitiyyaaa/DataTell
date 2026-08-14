@@ -197,4 +197,6 @@ if __name__ == "__main__":
     import uvicorn
     # Render sets the PORT env var; default to 8000 for local development
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run("api:app", host="0.0.0.0", port=port, reload=(port == 8000))
+    # Determine import string depending on whether run from root or backend/
+    app_target = "backend.api:app" if (root_dir / "backend").exists() and Path.cwd() == root_dir else "api:app"
+    uvicorn.run(app_target, host="0.0.0.0", port=port, reload=(port == 8000))
