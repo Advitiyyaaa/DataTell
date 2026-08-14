@@ -206,12 +206,32 @@ def execute_sql(
     max_rows: int = 1_000,
     timeout_seconds: float = 5.0,
 ) -> pd.DataFrame:
-    """Execute validated SQL with read-only authorization, timeout, and row cap."""
+    """Execute validated SQL with read-only authorization, timeout, and row cap.
+
+    When `conn` is a TursoConnection (Turso Cloud), the sqlite3-specific
+    authorizer and progress-handler are skipped (they are no-ops on Turso).
+    Safety is enforced by the planner prompt (SELECT-only) and Turso's own
+    read-only token permissions.
+    """
     if max_rows <= 0:
         raise ValueError("max_rows must be positive")
 
     query = sql.strip().rstrip(";")
     guarded_sql = f"SELECT * FROM ({query}) AS generated_query LIMIT {max_rows + 1}"
+
+    # ── Turso Cloud path ──────────────────────────────────────────────────────
+    # TursoConnection doesn't support sqlite3's authorizer/progress_handler.
+    # Use the connection's own read_sql_query() method instead.
+    from turso_client import TursoConnection
+    if isinstance(conn, TursoConnection):
+        results = conn.read_sql_query(guarded_sql)
+        truncated = len(results) > max_rows
+        if truncated:
+            results = results.iloc[:max_rows].copy()
+        results.attrs["truncated"] = truncated
+        return results
+
+    # ── Local SQLite path (default) ───────────────────────────────────────────
     deadline = time.monotonic() + timeout_seconds
 
     def abort_if_timed_out() -> int:

@@ -355,8 +355,24 @@ def make_both_tools_node(
     _rag_fn  = make_rag_tool_node(collection, bm25, chunks, model=model)
 
     def _run_sql_in_thread(state: AgentState) -> dict:
-        """Open a thread-local connection, run SQL, close it."""
-        thread_conn = sqlite3.connect(str(_db_path))
+        """Open a thread-local connection, run SQL, close it.
+
+        Thread-safety:
+          - sqlite3: connections are not thread-safe, so we open a fresh one.
+          - TursoConnection: each HTTP call is already independent, but we still
+            instantiate a fresh object per thread to be explicit and safe.
+        """
+        from turso_client import TursoConnection
+        if isinstance(conn, TursoConnection):
+            # Turso: create a fresh HTTP client for this thread
+            import os
+            thread_conn = TursoConnection(
+                url=os.environ["TURSO_DATABASE_URL"],
+                auth_token=os.environ["TURSO_AUTH_TOKEN"],
+            )
+        else:
+            # Local SQLite: open a fresh file connection
+            thread_conn = sqlite3.connect(str(_db_path))
         try:
             sql_fn = make_sql_tool_node(thread_conn, schema, model=model)
             return sql_fn(state)
@@ -999,12 +1015,12 @@ def load_resources(
 
     print("Loading database...")
     if use_turso:
-        # ── Turso Cloud (pyturso is a drop-in sqlite3 replacement) ────────────
+        # ── Turso Cloud (pure-Python HTTP client — no native compilation needed) ──
         try:
-            import turso  # pyturso
+            import turso_client
         except ImportError:
             raise ImportError(
-                "pyturso is required for Turso Cloud mode. Run: pip install pyturso"
+                "turso_client not found. Ensure scripts/turso_client.py exists."
             )
         turso_url   = os.getenv("TURSO_DATABASE_URL")
         turso_token = os.getenv("TURSO_AUTH_TOKEN")
@@ -1013,7 +1029,7 @@ def load_resources(
                 "TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must be set in .env "
                 "when USE_TURSO=true."
             )
-        conn = turso.connect(remote_url=turso_url, auth_token=turso_token)
+        conn = turso_client.connect(remote_url=turso_url, auth_token=turso_token)
         print(f"  Connected to Turso Cloud: {turso_url}")
     else:
         # ── Local SQLite (default) ─────────────────────────────────────────────

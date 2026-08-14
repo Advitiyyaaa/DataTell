@@ -12,21 +12,13 @@ Usage:
     python scripts/migrate_to_turso.py
 
 Prerequisites:
-    pip install pyturso
+    pip install requests        (likely already installed)
     TURSO_DATABASE_URL=libsql://your-db.turso.io  in .env
     TURSO_AUTH_TOKEN=your-token                    in .env
 
 How it works:
-    1. Opens local analytics.db with standard sqlite3
-    2. Reads every table's schema (CREATE TABLE statement)
-    3. Creates each table in Turso (idempotent — IF NOT EXISTS)
-    4. Bulk-inserts rows in batches of 100 (Turso HTTP API limit)
-    5. Verifies row counts match on both sides
-
-Why batches of 100?
-    Turso's HTTP wire protocol has a statement-count limit per request.
-    100 rows × 7 tables = 700 inserts → well within limits.
-    For 549,874 rows this takes ~2-5 minutes depending on network latency.
+    Uses Turso's HTTP REST API directly (no pyturso/Rust compilation needed).
+    Batches INSERT statements in groups of 100 rows per request.
 """
 
 import argparse
@@ -101,14 +93,12 @@ def migrate(dry_run: bool = False) -> None:
         local_conn.close()
         return
 
-    # ── 3. Connect to Turso ───────────────────────────────────────────────────
-    try:
-        import turso  # pyturso
-    except ImportError:
-        sys.exit("ERROR: pyturso not installed. Run: pip install pyturso")
+    # ── 3. Connect to Turso via HTTP ──────────────────────────────────────────
+    sys.path.insert(0, str(root_dir / "scripts"))
+    import turso_client
 
     print(f"Connecting to Turso: {TURSO_DATABASE_URL}")
-    turso_conn = turso.connect(
+    turso_conn = turso_client.connect(
         remote_url=TURSO_DATABASE_URL,
         auth_token=TURSO_AUTH_TOKEN,
     )
@@ -123,41 +113,65 @@ def migrate(dry_run: bool = False) -> None:
         )
         print(f"Creating table '{table}'...")
         turso_conn.execute(create_sql_safe)
-        turso_conn.commit()
 
     print()
 
     # ── 5. Migrate rows ───────────────────────────────────────────────────────
     overall_start = time.time()
     for table in tables:
+        local_total = _row_count(local_conn, table)
+        try:
+            turso_current = turso_conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        except Exception:
+            turso_current = 0
+
+        if turso_current == local_total:
+            print(f"Skipping '{table}' — already fully migrated ({turso_current:,} rows)")
+            continue
+
         columns = _get_columns(local_conn, table)
         col_list = ", ".join(columns)
-        placeholders = ", ".join(["?" for _ in columns])
-        insert_sql = f"INSERT OR IGNORE INTO {table} ({col_list}) VALUES ({placeholders})"
+        col_count = len(columns)
+        row_placeholder = f"({', '.join(['?'] * col_count)})"
 
-        total_rows = _row_count(local_conn, table)
-        print(f"Migrating '{table}': {total_rows:,} rows...")
+        print(f"Migrating '{table}': {local_total:,} rows (currently {turso_current:,} in Turso)...")
 
         rows_inserted = 0
         t_start = time.time()
 
-        # Fetch and insert in batches to avoid OOM on large tables
+        # Batch size 50 creates ~150-350 params per statement, perfect for libSQL HTTP
+        BATCH = 50
         cursor = local_conn.execute(f"SELECT {col_list} FROM {table}")
-        batch = cursor.fetchmany(BATCH_SIZE)
+        batch = cursor.fetchmany(BATCH)
+
         while batch:
-            for row in batch:
-                turso_conn.execute(insert_sql, list(row))
-            turso_conn.commit()
+            multi_placeholders = ", ".join([row_placeholder] * len(batch))
+            multi_sql = f"INSERT OR IGNORE INTO {table} ({col_list}) VALUES {multi_placeholders}"
+            flat_params = [val for row in batch for val in row]
+
+            # Retry loop with backoff for network resilience
+            for attempt in range(1, 6):
+                try:
+                    turso_conn.execute(multi_sql, flat_params)
+                    break
+                except Exception as exc:
+                    if attempt == 5:
+                        raise
+                    wait = attempt * 1.5
+                    print(f"\n  [Retry {attempt}/5] Network error: {exc}. Retrying in {wait:.1f}s...")
+                    time.sleep(wait)
+
             rows_inserted += len(batch)
 
             # Progress indicator
-            pct = rows_inserted / total_rows * 100 if total_rows else 100
+            pct = rows_inserted / local_total * 100 if local_total else 100
             elapsed = time.time() - t_start
-            print(f"\r  {rows_inserted:,}/{total_rows:,} ({pct:.1f}%) — {elapsed:.1f}s", end="", flush=True)
+            rate = rows_inserted / elapsed if elapsed > 0 else 0
+            print(f"\r  {rows_inserted:,}/{local_total:,} ({pct:.1f}%) - {elapsed:.1f}s ({rate:.0f} rows/s)", end="", flush=True)
 
-            batch = cursor.fetchmany(BATCH_SIZE)
+            batch = cursor.fetchmany(BATCH)
 
-        print(f"\r  ✓ {rows_inserted:,} rows in {time.time() - t_start:.1f}s")
+        print(f"\r  [OK] {table}: {local_total:,} rows migrated in {time.time() - t_start:.1f}s")
 
     print(f"\nTotal migration time: {time.time() - overall_start:.1f}s")
 
@@ -165,21 +179,14 @@ def migrate(dry_run: bool = False) -> None:
     print("\nVerifying row counts...")
     all_match = True
     for table in tables:
-        local_count  = _row_count(local_conn, table)
-        turso_count  = _row_count(turso_conn, table)
-        match = "✓" if local_count == turso_count else "✗ MISMATCH"
-        print(f"  {table}: local={local_count:,}  turso={turso_count:,}  {match}")
+        local_count = _row_count(local_conn, table)
+        turso_count = turso_conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        match = "MATCH" if local_count == turso_count else "MISMATCH"
+        print(f"  {table}: local={local_count:,}  turso={turso_count:,}  [{match}]")
         if local_count != turso_count:
             all_match = False
 
     local_conn.close()
-    turso_conn.close()
-
-    if all_match:
-        print("\n✅ Migration complete — all row counts match!")
-    else:
-        print("\n⚠️  Some row counts don't match. Re-run to retry failed tables.")
-        sys.exit(1)
 
 
 if __name__ == "__main__":

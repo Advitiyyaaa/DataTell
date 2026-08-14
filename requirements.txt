@@ -38,7 +38,7 @@ pydantic>=2.0.0
 plotly>=5.22.0
 
 # Cloud deploy (Phase 8)
-pyturso>=0.1.0          # Turso Cloud: drop-in sqlite3 replacement
+requests>=2.31.0         # Turso Cloud HTTP API client (via turso_client.py)
 
 # Dev / notebooks
 jupyterlab>=4.0.0

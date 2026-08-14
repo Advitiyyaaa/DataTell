@@ -155,9 +155,9 @@ def migrate() -> None:
     # ── 6. Verify ──────────────────────────────────────────────────────────────
     cloud_count = cloud_col.count()
     if cloud_count == local_count:
-        print(f"\n✅ Migration complete — {cloud_count} chunks in Chroma Cloud!")
+        print(f"\n[OK] Migration complete - {cloud_count} chunks in Chroma Cloud!")
     else:
-        print(f"\n⚠️  Count mismatch: local={local_count}, cloud={cloud_count}")
+        print(f"\n[WARN] Count mismatch: local={local_count}, cloud={cloud_count}")
         sys.exit(1)
 
 
