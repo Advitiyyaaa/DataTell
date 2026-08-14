@@ -37,32 +37,31 @@ def get_schema(conn: sqlite3.Connection) -> dict:
     schema: dict[str, Any] = {}
 
     # Get all user tables (exclude SQLite internal tables)
-    tables_df = pd.read_sql(
-        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;",
-        conn
+    cursor = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;"
     )
+    table_names = [row[0] for row in cursor.fetchall()]
 
-    for table_name in tables_df["name"]:
+    for table_name in table_names:
         # Column info
-        cols_df = pd.read_sql(f"PRAGMA table_info([{table_name}])", conn)
+        cols_cur = conn.execute(f"PRAGMA table_info([{table_name}])")
         columns = [
-            {"name": row["name"], "type": row["type"] or "TEXT"}
-            for _, row in cols_df.iterrows()
+            {"name": row[1], "type": row[2] or "TEXT"}
+            for row in cols_cur.fetchall()
         ]
 
         # Row count
-        count = pd.read_sql(
-            f"SELECT COUNT(*) as cnt FROM [{table_name}]", conn
-        ).iloc[0, 0]
+        count_cur = conn.execute(f"SELECT COUNT(*) FROM [{table_name}]")
+        count_row = count_cur.fetchone()
+        count = count_row[0] if count_row else 0
 
         # Sample rows — 3 rows, values truncated to 50 chars for long strings
-        sample_df = pd.read_sql(
-            f"SELECT * FROM [{table_name}] LIMIT 3", conn
-        )
+        sample_cur = conn.execute(f"SELECT * FROM [{table_name}] LIMIT 3")
+        sample_cols = [desc[0] for desc in sample_cur.description] if sample_cur.description else []
         sample_rows = []
-        for _, row in sample_df.iterrows():
+        for row in sample_cur.fetchall():
             cleaned = {}
-            for col, val in row.items():
+            for col, val in zip(sample_cols, row):
                 if isinstance(val, str) and len(val) > 50:
                     val = val[:47] + "..."
                 cleaned[col] = val

@@ -103,7 +103,7 @@ def health():
     }
 
 
-async def _ensure_agent_ready(timeout_seconds: float = 60.0):
+async def _ensure_agent_ready(timeout_seconds: float = 120.0):
     """Wait for agent initialization if still in progress."""
     import time
     start = time.time()

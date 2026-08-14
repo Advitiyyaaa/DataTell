@@ -285,6 +285,13 @@ def build_index(
     import chromadb
     from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
+    # Limit torch to 1 thread to avoid 100% CPU lockup on cloud free-tier containers (Render)
+    try:
+        import torch
+        torch.set_num_threads(1)
+    except Exception:
+        pass
+
     # Embedding function — sentence-transformers runs locally, no API calls
     ef = SentenceTransformerEmbeddingFunction(model_name=embedding_model)
 
