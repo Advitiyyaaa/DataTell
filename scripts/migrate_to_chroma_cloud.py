@@ -120,24 +120,17 @@ def migrate() -> None:
     print("Connected.\n")
 
     # ── 4. Create (or get) the cloud collection ────────────────────────────────
-    cloud_col = cloud_client.get_or_create_collection(
+    try:
+        cloud_client.delete_collection(COLLECTION_NAME)
+    except Exception:
+        pass
+
+    cloud_col = cloud_client.create_collection(
         name=COLLECTION_NAME,
+        embedding_function=ef,
         metadata={"hnsw:space": "cosine"},
     )
-    cloud_existing = cloud_col.count()
-    print(f"Cloud collection '{COLLECTION_NAME}': {cloud_existing} existing chunks")
-
-    if cloud_existing == local_count:
-        print("✅ Cloud collection already has the correct number of chunks — nothing to do.")
-        return
-
-    if cloud_existing > 0:
-        print(f"Deleting {cloud_existing} stale chunks before re-upload...")
-        cloud_client.delete_collection(COLLECTION_NAME)
-        cloud_col = cloud_client.create_collection(
-            name=COLLECTION_NAME,
-            metadata={"hnsw:space": "cosine"},
-        )
+    print(f"Created Cloud collection '{COLLECTION_NAME}' with SentenceTransformer embeddings")
 
     # ── 5. Upload in batches ───────────────────────────────────────────────────
     print(f"Uploading {local_count} chunks to Chroma Cloud...")

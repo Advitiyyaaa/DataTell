@@ -64,8 +64,8 @@ class TursoCursor:
         self._pos += len(result)
         return result
 
-    def __iter__(self):
-        return iter(self._rows)
+    def close(self) -> None:
+        pass
 
 
 def _cast(cell: dict) -> Any:
@@ -103,6 +103,12 @@ class _TursoExecutor:
 
     def fetchone(self) -> Optional[tuple]:
         return self._cursor.fetchone() if self._cursor else None
+
+    def fetchmany(self, size: int = 1) -> list[tuple]:
+        return self._cursor.fetchmany(size) if self._cursor else []
+
+    def close(self) -> None:
+        pass
 
 
 # ---------------------------------------------------------------------------
