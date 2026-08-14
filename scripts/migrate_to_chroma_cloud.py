@@ -89,11 +89,11 @@ def migrate() -> None:
         sys.exit(f"ERROR: local chroma_db/ not found at {LOCAL_CHROMA_DIR}")
 
     print("Reading local ChromaDB collection...")
-    ef = SentenceTransformerEmbeddingFunction(model_name=EMBEDDING_MODEL)
+    from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
+
+    ef = ONNXMiniLM_L6_V2()
     local_client = chromadb.PersistentClient(path=str(LOCAL_CHROMA_DIR))
-    local_col = local_client.get_collection(
-        name=COLLECTION_NAME, embedding_function=ef
-    )
+    local_col = local_client.get_collection(name=COLLECTION_NAME)
     local_count = local_col.count()
     print(f"  Found {local_count} chunks locally")
 
@@ -130,7 +130,7 @@ def migrate() -> None:
         embedding_function=ef,
         metadata={"hnsw:space": "cosine"},
     )
-    print(f"Created Cloud collection '{COLLECTION_NAME}' with SentenceTransformer embeddings")
+    print(f"Created Cloud collection '{COLLECTION_NAME}' with ONNXMiniLM_L6_V2 embeddings")
 
     # ── 5. Upload in batches ───────────────────────────────────────────────────
     print(f"Uploading {local_count} chunks to Chroma Cloud...")

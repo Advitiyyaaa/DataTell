@@ -309,11 +309,17 @@ def build_index(
             database=database,
             api_key=api_key,
         )
-        collection = client.get_or_create_collection(
-            name=collection_name,
-            embedding_function=ef,
-            metadata={"hnsw:space": "cosine"},
-        )
+        try:
+            collection = client.get_collection(
+                name=collection_name,
+                embedding_function=ef,
+            )
+        except Exception:
+            collection = client.get_or_create_collection(
+                name=collection_name,
+                embedding_function=ef,
+                metadata={"hnsw:space": "cosine"},
+            )
         print(f"  Connected to Chroma Cloud collection '{collection_name}': {collection.count()} docs")
     else:
         # ── Local PersistentClient mode (default) ──────────────────────────────
