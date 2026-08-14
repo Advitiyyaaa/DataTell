@@ -43,17 +43,14 @@ class QueryRequest(BaseModel):
 
 # Global state for graph
 agent_graph = None
-
+agent_init_error = None
 _db_path = root_dir / "db" / "analytics.db"
 
 
-@app.on_event("startup")
-def startup_event():
-    global agent_graph
-    print("Initializing DataTell Agent...")
+def _initialize_agent_sync():
+    global agent_graph, agent_init_error
+    print("Initializing DataTell Agent in background...")
 
-    # Cloud mode flags — read from environment variables
-    # Set USE_TURSO=true and CHROMA_MODE=cloud in Render env vars for production.
     use_turso   = os.getenv("USE_TURSO", "false").lower() == "true"
     chroma_mode = os.getenv("CHROMA_MODE", "local")
 
@@ -67,19 +64,58 @@ def startup_event():
         )
 
         if not use_turso:
-            # FastAPI runs sync endpoints in worker threads, but conn was created in the startup thread.
-            # This causes SQLite "objects created in a thread can only be used in that same thread" errors.
-            # Since our queries are read-only, we can recreate the connection with check_same_thread=False.
-            # (pyturso handles thread-safety internally, so this is only needed for local SQLite.)
             conn.close()
             thread_safe_conn = sqlite3.connect(str(_db_path), check_same_thread=False)
         else:
-            thread_safe_conn = conn  # pyturso is thread-safe
+            thread_safe_conn = conn
 
         agent_graph = build_agent_graph(thread_safe_conn, schema, collection, bm25, chunks)
-        print("Agent ready.")
+        print("DataTell Agent ready.")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
+        agent_init_error = str(e)
         print(f"Failed to initialize agent: {e}")
+
+
+@app.on_event("startup")
+async def startup_event():
+    # Start agent initialization in a background worker thread so Uvicorn opens the port instantly
+    asyncio.create_task(asyncio.to_thread(_initialize_agent_sync))
+
+
+@app.get("/")
+def root():
+    return {
+        "status": "online",
+        "app": "DataTell API",
+        "ready": agent_graph is not None,
+        "error": agent_init_error,
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy" if agent_init_error is None else "degraded",
+        "ready": agent_graph is not None,
+        "error": agent_init_error,
+    }
+
+
+async def _ensure_agent_ready(timeout_seconds: float = 60.0):
+    """Wait for agent initialization if still in progress."""
+    import time
+    start = time.time()
+    while agent_graph is None and agent_init_error is None:
+        if time.time() - start > timeout_seconds:
+            break
+        await asyncio.sleep(0.5)
+
+    if agent_init_error:
+        raise HTTPException(status_code=500, detail=f"Agent initialization failed: {agent_init_error}")
+    if agent_graph is None:
+        raise HTTPException(status_code=503, detail="Agent is warming up. Please retry in 10 seconds.")
 
 
 def _serialize_result(result: dict) -> dict:
@@ -101,12 +137,9 @@ def _run_agent_sync(question: str, history: list) -> dict:
 @app.post("/query")
 async def query(req: QueryRequest):
     """Standard JSON endpoint — waits for the full answer then returns it."""
-    if not agent_graph:
-        raise HTTPException(status_code=500, detail="Agent graph not initialized")
+    await _ensure_agent_ready()
     try:
         history = [{"role": h.role, "content": h.content} for h in req.conversation_history]
-        # Run blocking agent in a thread pool so we don't block the event loop,
-        # with a 120-second hard timeout to prevent hung Gemini calls.
         result = await asyncio.wait_for(
             asyncio.get_event_loop().run_in_executor(
                 None, _run_agent_sync, req.question, history
@@ -124,9 +157,8 @@ async def query(req: QueryRequest):
 
 @app.post("/query/stream")
 async def query_stream(req: QueryRequest):
-    """
-    SSE streaming endpoint.
-    Emits events as the answer arrives so the frontend can typewriter-render them.
+    """SSE streaming endpoint."""
+    await _ensure_agent_ready()
 
     Event protocol (each line: "data: <json>\\n\\n"):
       - {"type": "meta",   "route": "...", "route_reason": "..."}
