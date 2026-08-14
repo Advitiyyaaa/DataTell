@@ -157,8 +157,9 @@ async def query(req: QueryRequest):
 
 @app.post("/query/stream")
 async def query_stream(req: QueryRequest):
-    """SSE streaming endpoint."""
-    await _ensure_agent_ready()
+    """
+    SSE streaming endpoint.
+    Emits events as the answer arrives so the frontend can typewriter-render them.
 
     Event protocol (each line: "data: <json>\\n\\n"):
       - {"type": "meta",   "route": "...", "route_reason": "..."}
@@ -167,8 +168,7 @@ async def query_stream(req: QueryRequest):
                            "answer_quality": ..., "critique": ..., "total_ms": ...}
       - {"type": "error",  "message": "..."}
     """
-    if not agent_graph:
-        raise HTTPException(status_code=500, detail="Agent graph not initialized")
+    await _ensure_agent_ready()
 
     history = [{"role": h.role, "content": h.content} for h in req.conversation_history]
 
